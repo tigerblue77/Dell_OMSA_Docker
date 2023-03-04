@@ -1,28 +1,33 @@
-# Use CentOS 7 base image from Docker Hub
-# FROM centos:centos7.6
-FROM almalinux:8.6
-MAINTAINER Shane Mc Cormack <dataforce@dataforce.org.uk>
+FROM almalinux:latest
 
-# Environment variables
+LABEL org.opencontainers.image.authors="tigerblue77"
+
+# Set environment variables
 ENV PATH $PATH:/opt/dell/srvadmin/bin:/opt/dell/srvadmin/sbin
 
-# Do overall update and install missing packages needed for OpenManage
-RUN dnf -y update && \
-    dnf -y install wget perl passwd which procps
+# Update local packages list
+RUN dnf -y update
 
+# Install Dell OpenManage Server Administrator dependancies
+RUN dnf -y install wget perl passwd procps kmod
 
-#    dnf -y install gcc wget perl passwd which tar libstdc++.so.6 procps
+# Add Dell Linux repository
+RUN wget -q -O - https://linux.dell.com/repo/hardware/dsu/bootstrap.cgi | bash
 
-# Add OMSA repo.
-RUN wget -q -O -  https://linux.dell.com/repo/hardware/dsu/bootstrap.cgi | bash
+# Install all Dell OpenManage Server Administrator packages (we could select specific components instead)
+RUN dnf -y install srvadmin-all
 
-# Let's "install all", however we can select specific components instead
-RUN dnf -y install srvadmin-all && dnf clean all
+# Uninstall dependencies which are no longer required
+RUN dnf -y remove wget
+
+# Clean cache files and repository metadata
+RUN dnf clean all
 
 # Prevent daemon helper scripts from making systemd calls
 ENV SYSTEMCTL_SKIP_REDIRECT=1
 
-COPY ./docker/run.sh /run.sh
+# Copy Docker container's script to Docker image
+ADD configure_and_run_Dell_OMSA.sh /configure_and_run_Dell_OMSA.sh
 
 # Run the application
-CMD /run.sh
+CMD /configure_and_run_Dell_OMSA.sh

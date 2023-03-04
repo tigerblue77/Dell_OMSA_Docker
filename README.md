@@ -1,4 +1,4 @@
-# docker-omsa
+# Dell_OMSA_Docker
 
 Dell OpenManage Server Administrator in Docker.
 
@@ -12,17 +12,19 @@ No SNMP support, maybe later.
 
 This can be ran with something like:
 
-```sh
-docker run --privileged -d -p 1311:1311 --restart=always \
-    -e OMSA_USER="SomeUsername" -e OMSA_PASS="SomePassword" \
+```bash
+docker run -d \
+    --privileged \
+    --restart=unless-stopped \
+    -e OMSA_username="SomeUsername" \
+    -e OMSA_password="SomePassword" \
     -v /lib/modules/`uname -r`:/lib/modules/`uname -r` \
-    --name=omsa shanemcc/docker-omsa
+    -p 1311:1311 \
+    --name=Dell_OMSA tigerblue77/Dell_OMSA
 ```
 
 And you can then query things with something like:
 
 ```sh
-docker exec omsa omreport chassis bios
+docker exec Dell_OMSA omreport chassis bios
 ```
-
-etc.
