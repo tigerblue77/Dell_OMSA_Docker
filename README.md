@@ -12,7 +12,9 @@ Dell OpenManage Server Administrator, in a container. It gives you the OMSA web 
 That last part is the whole point. OMSA is a sprawling install: a private JRE, a Tomcat, a dozen daemons and a set of kernel-module helpers, all of it pinned to one distribution's package set. Putting it in a container keeps it off a hypervisor whose packages you would rather not fight with, and lets you throw it away and rebuild it when Dell moves.
 
 > [!WARNING]
-> **OMSA reached the end of its life on 30 September 2024.** Dell's own [end of life page](https://www.dell.com/support/kbdoc/en-us/000224826/omsa-eol-landing-page) says it plainly: that was the final release, it is in sustenance mode — security and critical-escalation fixes only — **until 30 September 2027**, and it supports **14th, 15th and 16th generation** PowerEdge servers. It does **not** support the 17th. Dell's stated replacement is iDRAC together with the [iDRAC Service Module](https://www.dell.com/support/kbdoc/en-us/000178050/support-for-idrac-service-module-ism).
+> **OMSA reached the end of its life on 30 September 2024.** Dell's own [end of life page](https://www.dell.com/support/kbdoc/en-us/000224826/omsa-eol-landing-page) says it plainly: that was the final release, and it is in sustenance mode — security and critical-escalation fixes only — **until 30 September 2027**. Dell's stated replacement is iDRAC together with the [iDRAC Service Module](https://www.dell.com/support/kbdoc/en-us/000178050/support-for-idrac-service-module-ism).
+>
+> That page also says the final release "supports 14th, 15th, and 16th-Generation servers". That is a ceiling rather than a floor, and the [requirements](#your-server) section below says what OMSA itself does about older machines.
 >
 > This image is worth running anyway if you have a 14G to 16G server and want what OMSA gives you. It is worth knowing before you build a monitoring stack on top of it. If all you want is metrics, an agentless Redfish exporter talking to your iDRAC over the network needs no privileged container, no kernel modules and no agent on the host at all — and it will outlive OMSA.
 
@@ -41,9 +43,31 @@ A Dell PowerEdge. Which generations actually work is decided by the OMSA release
 
 | PowerEdge generation | OMSA 11.1.0.0, which this image installs |
 | --- | --- |
-| 14th, 15th, 16th | Supported, and what the final OMSA release targets |
-| 13th and older | Not in the supported list any more. Older OMSA releases covered them, and Dell still publishes those, so an older server is a matter of installing an older OMSA rather than a lost cause |
-| 17th | **Never supported.** OMSA was discontinued before it shipped — use iDRAC and iSM |
+| 14th, 15th, 16th | What Dell's final release was tested against, and what its support statement covers |
+| 13th, and older still | **Recognised, and not the same thing as supported.** See below |
+| 17th | **Never.** OMSA was discontinued before it shipped, and the 17th generation is in no list of its — use iDRAC and iSM |
+
+Dell's end of life page says the final release "supports 14th, 15th, and 16th-Generation servers".
+Read in place, that sentence is the answer to *does it support the 17th* — a ceiling, not a floor.
+What OMSA itself does at run time is a separate question, and it is answerable rather than arguable:
+`srvadmin-omilcore` ships a platform list, `syslist.txt`, and `CheckSystemType` refuses to start the
+data engine on a system identifier that is not in it.
+
+That file, extracted from `srvadmin-omilcore-11.1.0.0-5773.el9.x86_64.rpm` — the exact package this
+image installs — carries the whole 13th generation:
+
+```
+0600=PER730   0601=PER630   0602=PET630   0627=PER730XD   060E=PEM630   061B=PEFC630
+```
+
+and keeps going back through the 12th and into the 11th (`0235=PER710`, `0236=PER610`,
+`0237=PET610`). So an R730 or a T630 starts, where a 17th-generation machine would not.
+
+**Recognised is not a promise that everything reports.** Dell withdrew *support* for these
+generations, not the code path, and the half most likely to have quietly rotted is storage — the
+PERC libraries, rather than the BMC. Nobody has published `omreport storage` output from OMSA 11.x
+on a 13th-generation server, so if you run one, that output is worth posting to
+[issue #4](https://github.com/tigerblue77/Dell_OMSA_Docker/issues/4).
 
 OMSA reads the hardware through the host, so the container has to run on the PowerEdge itself. It is not a remote management tool: it cannot be pointed at another machine the way an iDRAC client can.
 
