@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Test suite
 
 Automated tests for the Dell OMSA Docker image's entrypoint. Everything runs

@@ -10,17 +10,46 @@
 
 # The two SPDX lines every authored file here carries. The identifier is the
 # project's own, stated in LICENSE and NOTICE ; the copyright line is what
-# attributes it
-readonly SPDX_LICENCE_LINE='# SPDX-License-Identifier: AGPL-3.0-only'
-readonly SPDX_COPYRIGHT_LINE='# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors'
+# attributes it.
+#
+# Held WITHOUT a comment marker, because the marker is the file type's business
+# and not the header's : a shell script and a YAML file carry them behind "# ",
+# Markdown carries them inside an <!-- --> block, and the Dockerfile behind "#"
+# again. Matching the text rather than the line lets one check cover all of
+# them, which is what stops a new file type quietly falling outside it -- the
+# way every Markdown file in this tree did until it was noticed.
+readonly SPDX_LICENCE_TEXT='SPDX-License-Identifier: AGPL-3.0-only'
+readonly SPDX_COPYRIGHT_TEXT='SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors'
+
+# Kept for the failure message, which is worth printing in the shape the reader
+# has to type
+readonly SPDX_LICENCE_LINE="# $SPDX_LICENCE_TEXT"
+readonly SPDX_COPYRIGHT_LINE="# $SPDX_COPYRIGHT_TEXT"
 
 # Read from the first five lines : a header is only a header where a reader and
 # a scanner both find it, and one buried below the code it covers discharges
-# nothing
+# nothing. Five is enough for every shape in this tree -- a shebang, a blank
+# line and the two lines, or the four lines of an HTML comment block
 function carries_the_licence_header() {
   local -r HEAD="$(head -5 "$1")"
 
-  [[ "$HEAD" == *"$SPDX_COPYRIGHT_LINE"* ]] && [[ "$HEAD" == *"$SPDX_LICENCE_LINE"* ]]
+  [[ "$HEAD" == *"$SPDX_COPYRIGHT_TEXT"* ]] && [[ "$HEAD" == *"$SPDX_LICENCE_TEXT"* ]]
+}
+
+# Every Markdown file this repository authors. Globbed for the same reason the
+# shell scripts are : a document added later is covered rather than forgotten.
+#
+# LICENSE is deliberately absent -- it is the AGPL's own text, verbatim from the
+# FSF, and a copyright line of this project's on top of it would be a claim over
+# somebody else's document
+function every_markdown_file_of_the_tree() {
+  shopt -s globstar nullglob
+  local DOCUMENT
+  for DOCUMENT in "$REPO_ROOT"/*.md "$REPO_ROOT"/.github/**/*.md \
+    "$REPO_ROOT"/tools/*.md "$TESTS_DIRECTORY"/*.md; do
+    [ -f "$DOCUMENT" ] && printf '%s\n' "$DOCUMENT"
+  done
+  shopt -u globstar nullglob
 }
 
 # The interpreter a script declares, so that a POSIX sh script is parsed by sh
@@ -87,6 +116,51 @@ function test_every_file_the_test_suite_ships_carries_the_licence_header() {
     fi
   done
   shopt -u nullglob
+}
+
+function test_every_markdown_document_carries_the_licence_header() {
+  # Markdown carries the same two lines, inside an <!-- --> block, and until it
+  # was asked out loud nothing checked that it did -- the header walk covered
+  # shell, YAML and the Dockerfile, and every document in the tree sat outside
+  # it. A rule stated in CONTRIBUTING and enforced by nothing is a rule that
+  # holds exactly as long as whoever wrote it is still reading the diffs.
+  #
+  # Held to the same gate as the case above : a header is a claim about terms,
+  # and it cannot be made before the repository states any.
+  if [ ! -f "$REPO_ROOT/LICENSE" ]; then
+    skip_test "the repository states no licence yet, so no document can be held to an SPDX header"
+    return 0
+  fi
+
+  local DOCUMENT
+  while IFS= read -r DOCUMENT; do
+    if carries_the_licence_header "$DOCUMENT"; then
+      pass
+    else
+      fail "${DOCUMENT#"$REPO_ROOT"/} carries no SPDX licence header in its first five lines" \
+        "expected both, inside an HTML comment :" "$SPDX_COPYRIGHT_TEXT" "$SPDX_LICENCE_TEXT"
+    fi
+  done < <(every_markdown_file_of_the_tree)
+}
+
+function test_the_test_suite_readme_carries_the_licence_header() {
+  # Split out from the walk above so that it is checked whatever the rest of the
+  # repository does, for the same reason the suite's own scripts are : it is
+  # written here, so a header missing from it is this pull request's omission
+  # rather than a question about what the project has adopted
+  local -r README="$TESTS_DIRECTORY/README.md"
+
+  if [ ! -f "$README" ]; then
+    fail "tests/README.md is missing"
+    return 1
+  fi
+
+  if carries_the_licence_header "$README"; then
+    pass
+  else
+    fail "tests/README.md carries no SPDX licence header in its first five lines" \
+      "expected both, inside an HTML comment :" "$SPDX_COPYRIGHT_TEXT" "$SPDX_LICENCE_TEXT"
+  fi
 }
 
 function test_every_file_of_the_repository_carries_the_licence_header() {
