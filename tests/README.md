@@ -23,12 +23,13 @@ take, or one without the value it takes.
 ## What is being tested, and why it needs a sandbox
 
 `configure_and_run_Dell_OMSA.sh` is not a library. It is a one-shot provisioning
-script : it validates two environment variables, creates an account, sets its
-password, writes OMSA's role map, writes and enables `/etc/rc.local`, removes two
-systemd units and then `exec`s `/sbin/init`. Nothing in it can be sourced and
-called function by function, so every behavioural case here runs the whole
-script as a process and reads back what it did — from the files it wrote, and
-from what the mocked commands recorded.
+script : it reads two credentials — from the environment, or from the files
+`OMSA_username_FILE` and `OMSA_password_FILE` name — validates them, creates an
+account, sets its password, writes OMSA's role map, writes and enables
+`/etc/rc.local`, removes two systemd units and then `exec`s `/sbin/init`.
+Nothing in it can be sourced and called function by function, so every
+behavioural case here runs the whole script as a process and reads back what it
+did — from the files it wrote, and from what the mocked commands recorded.
 
 Which is exactly the problem. Those paths are absolute, and an absolute path is
 resolved without ever consulting the `PATH` : a mock first in the `PATH` cannot
@@ -40,8 +41,8 @@ builds a throwaway `$TEST_ROOT`, copies the entrypoint into it, and rewrites eac
 absolute path the script names to the same path underneath `$TEST_ROOT` —
 `/etc/rc.local` becomes `$TEST_ROOT/etc/rc.local`, `exec /sbin/init` becomes
 `exec $TEST_ROOT/sbin/init`, where a mocked init is waiting. The commands the
-script calls by name (`adduser`, `chpasswd`, `systemctl`, `chmod`, `rm`) are
-mocked the usual way, first in the `PATH`.
+script calls by name (`getent`, `useradd`, `chpasswd`, `systemctl`, `chmod`,
+`rm`) are mocked the usual way, first in the `PATH`.
 
 The rewrite is driven by `ENTRYPOINT_ABSOLUTE_PATHS` in `lib/harness.sh` : one
 declared entry per absolute path, each marked `sandbox` (the script reads,
@@ -64,21 +65,27 @@ keep it honest :
 | --- | --- |
 | `cases/10_shell_scripts.sh` | The repository's own files : the syntax of every script under the shell it declares, the SPDX header on the files this suite ships and (once the repository states a licence) on the files the image is built from, the shellcheck workflow's hand-maintained list against the tree — and the sandbox substitution map, in both directions, against the paths the entrypoint actually names |
 | `cases/12_github_workflows.sh` | The workflow that publishes the image, which no pull request ever runs : that every `.github` YAML file parses, that every action a step uses names a version, and that the shell of every `run:` block still parses — no linter here reads it |
-| `cases/20_credential_validation.sh` | `OMSA_username` and `OMSA_password` : missing, empty, one of the two, both — the status the container stops with, the message it stops on, and that a refused start provisions nothing at all |
-| `cases/30_user_provisioning.sh` | The account : created when it is absent, left alone when it is there, its password set either way, and the password travelling on a standard input rather than on a command line. Also the defects of the `/etc/passwd` lookup it decides from, and of the two commands around it, each pinned as it behaves today |
-| `cases/40_omarolemap.sh` | OMSA's role map, the file whose content is a permission : that it names the account the container was given and grants it `Administrator`, on every host, with one entry after any number of restarts |
-| `cases/50_service_handover.sh` | The three links that make the container a running OMSA : `rc.local` written with OMSA's own service commands, made executable, its unit enabled — and the handover to `/sbin/init`, asserted as an `exec` rather than as a call |
+| `cases/20_credential_validation.sh` | `OMSA_username` and `OMSA_password` : missing, empty, one of the two, both — the status the container stops with, the message it stops on, and that a refused start provisions nothing at all. Then the same two given as files, `OMSA_username_FILE` and `OMSA_password_FILE` : read from the file, refused when it is not there or is empty, refused when a value is given twice over, and a password keeping every space it holds |
+| `cases/30_user_provisioning.sh` | The account : created when it is absent, left alone when it is there, its password set either way, and the password travelling on a standard input rather than on a command line — never in the log, and not in the environment `init` is handed. Then what the lookup and the two commands around it answer for an unusual name, and what a refused `useradd` or `chpasswd` stops |
+| `cases/40_omarolemap.sh` | OMSA's role map, the file whose content is a permission : that it names the account the container was given and grants it `Administrator`, on every host, with one entry after any number of restarts — and that a role map which could not be written stops the container rather than leaving it to come up with no rights in it |
+| `cases/50_service_handover.sh` | The three links that make the container a running OMSA : `rc.local` written with OMSA's own service commands, made executable, its unit enabled — and the handover to `/sbin/init`, asserted as an `exec` rather than as a call. Each of the three is also exercised refused, because a link that did not take is a container that comes up healthy with no OMSA in it |
 | `cases/60_systemd_unit_removal.sh` | `getty@.service` and `autovt@.service`, removed when the base image ships them and not an error when it does not, with the rest of the unit directory left alone |
 
-Several cases in `30_`, `40_`, `50_` and `60_` pin behaviour that is **wrong**
-rather than behaviour that is right. Each says so in a comment, names the defect
-and says what a later pull request is expected to change : a case-insensitive,
-unescaped `grep` over `/etc/passwd` standing in for a user database lookup, a
-username passed to `adduser` with no `--` in front of it, a password piped
-through `echo`, and the failures of `systemctl` and `rm` that the entrypoint
-ignores. Documenting them is what makes that rewrite visible instead of silent —
-the case fails, somebody reads why, and the expectation moves in the same commit
-as the fix.
+Six cases in `30_` and `50_` used to pin behaviour that was **wrong** rather
+than behaviour that was right, each naming the defect and saying what a later
+pull request was expected to change : a case-insensitive, unescaped `grep` over
+`/etc/passwd` standing in for a user database lookup, a username passed to
+`adduser` with no `--` in front of it, a password piped through `echo`, and a
+refused `systemctl enable` the entrypoint ignored.
+
+That pull request is the entrypoint rewrite for issues #10 and #11, and all six
+moved with it : same case, same defect named in the comment, and an assertion
+that now reads the behaviour which replaced it. Documenting them is what made
+the rewrite visible instead of silent — the case failed, somebody read why, and
+the expectation moved in the same commit as the fix. One case in `60_` is still
+of that kind and is not a defect : a refused `rm` of the two terminal units is
+deliberately not fatal, because a base image that does not ship them is
+legitimate, and the entrypoint says so in the log instead of stopping.
 
 ## Reports
 
@@ -114,9 +121,12 @@ map ; the sandboxed copy of the entrypoint ; the mocks first in the `PATH` ; and
 the variables the Dockerfile sets, with `OMSA_username` and `OMSA_password`
 unset, which is what `docker run` without them gives the container.
 
-`mocks/getent` and `mocks/useradd` are shipped although nothing calls them yet :
-they are what the `/etc/passwd` grep and the `adduser` call are expected to
-become, and a mock is cheaper to write before the rewrite than during it.
+`mocks/getent` and `mocks/useradd` were shipped before anything called them :
+they are what the `/etc/passwd` grep and the `adduser` call became in the
+rewrite for issues #10 and #11, and a mock is cheaper to write before a rewrite
+than during it. `mocks/adduser` stays behind them, unused by the entrypoint : a
+handful of cases read its call log to assert that the tool it replaced was not
+reached either.
 
 ## Adding a test case
 
@@ -135,7 +145,7 @@ function test_the_role_map_grants_the_requested_user_administrator() {
   assert_equals "0" "$ENTRYPOINT_EXIT_CODE"
   assert_matches "$(sandbox_file_content /opt/dell/srvadmin/etc/omarolemap)" \
     '^omsauser[[:space:]]'
-  assert_equals "1" "$(count_calls_matching adduser '^adduser omsauser$')"
+  assert_equals "1" "$(count_calls_matching useradd '^useradd -- omsauser$')"
 }
 ```
 
@@ -159,9 +169,20 @@ The helpers a case is written with, all from `lib/harness.sh` :
 | `recorded_chpasswd_input` | What chpasswd was handed on its standard input, which is where the password travels |
 | `the_entrypoint_reached_init` | Whether the handover to systemd happened |
 
+A credential mounted as a file has two more,
+`given_the_password_is_in_a_file VALUE` and `given_the_username_is_in_a_file VALUE`,
+which live in `cases/20_credential_validation.sh` rather than in the harness :
+they are that one file's business, and a case file is sourced into the same
+shell as every other, so a helper declared there is available wherever it is
+needed.
+
 What a mocked command answers is set through its own `MOCK_<COMMAND>_*`
 variables, each documented at the top of the mock : an exit code, an output, and
 for some of them a value that takes over after a given number of calls. Two of
 them, `mocks/chmod` and `mocks/rm`, record the call and then do the real thing
 inside the sandbox, so that a case can assert on the mode and on the file being
-gone rather than only on the command having been issued.
+gone rather than only on the command having been issued. A third, `mocks/init`,
+writes the environment it was handed to `$MOCK_INIT_ENVIRONMENT_LOG` when a case
+asks for it : the entrypoint takes the password back out of the environment once
+chpasswd has used it, and the environment the handover passed on is the only
+place a test can read that it did.
