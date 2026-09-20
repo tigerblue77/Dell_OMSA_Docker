@@ -60,7 +60,10 @@ function test_the_role_map_names_the_account_that_was_asked_for() {
 
   assert_matches "$(role_map_entries)" '^an\.unusual-user_1[[:space:]]' \
     "the role map should name the account the container was given, verbatim"
-  assert_equals "1" "$(count_calls_matching adduser '^adduser an\.unusual-user_1$')" \
+  # "useradd -- <name>" since the rewrite for issues #10 and #11 : the account
+  # tool changed and the name moved behind a "--", while what this case is about
+  # -- the role map and the account naming the same user -- did not
+  assert_equals "1" "$(count_calls_matching useradd '^useradd -- an\.unusual-user_1$')" \
     "and that same name should be the one the account was created under"
 }
 
@@ -133,5 +136,27 @@ function test_the_role_map_is_written_before_the_handover_to_init() {
 
   assert_not_empty "$(role_map_entries)" "the role map should be written"
   assert_command_succeeds "and the entrypoint should have reached init afterwards" \
+    the_entrypoint_reached_init
+}
+
+function test_a_role_map_that_cannot_be_written_stops_the_container() {
+  # The file whose content is a permission, and issue #10 read from its most
+  # expensive angle : the write was not checked, so a role map that did not get
+  # written left a container that starts, authenticates the account and shows it
+  # nothing at all. Every OMSA command answers "insufficient rights", which is
+  # what somebody reads instead of "the entrypoint could not write this file".
+  #
+  # Made to fail by taking the directory away, which is what a base image that
+  # moved OMSA, or a package that did not install, looks like from here
+  given_the_credentials "omsauser" "hunter2"
+  command -p rm -rf "$(sandbox_path /opt/dell/srvadmin/etc)"
+
+  run_entrypoint
+
+  assert_not_equals "0" "$ENTRYPOINT_EXIT_CODE" \
+    "a role map that could not be written should stop the container"
+  assert_not_empty "$ENTRYPOINT_OUTPUT" \
+    "and should say so rather than stopping silently"
+  assert_command_fails "the handover should not happen on top of it" \
     the_entrypoint_reached_init
 }

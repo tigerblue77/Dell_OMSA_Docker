@@ -19,6 +19,14 @@
 # Recognized environment variables:
 #   MOCK_INIT_CALL_LOG           file the invocations are appended to. An empty
 #                                one means the handover never happened
+#   MOCK_INIT_ENVIRONMENT_LOG    file the environment it was handed is written
+#                                to, one "NAME=value" per line. Nothing else can
+#                                read that : the entrypoint takes the password
+#                                out of the environment once it has been used,
+#                                so that init and everything systemd starts
+#                                under it do not inherit it, and the only place
+#                                a test can see that it did is the environment
+#                                the handover actually passed on
 #   MOCK_INIT_OUTPUT             what it prints before exiting
 #   MOCK_INIT_EXIT_CODE          exit code (default 0). A distinctive value is
 #                                how a test tells an "exec" from a plain call :
@@ -26,6 +34,10 @@
 
 if [ -n "${MOCK_INIT_CALL_LOG:-}" ]; then
   printf '%s\n' "init${*:+ $*}" >> "$MOCK_INIT_CALL_LOG"
+fi
+
+if [ -n "${MOCK_INIT_ENVIRONMENT_LOG:-}" ]; then
+  env > "$MOCK_INIT_ENVIRONMENT_LOG"
 fi
 
 if [ -n "${MOCK_INIT_OUTPUT:-}" ]; then

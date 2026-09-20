@@ -135,21 +135,68 @@ function test_the_provisioning_is_complete_before_the_handover() {
     "and rc.local too"
 }
 
-function test_a_refused_service_enable_does_not_stop_the_container() {
-  # Documented rather than judged : systemctl runs while systemd is not up yet
-  # -- it is started by the very next line -- so its refusals are expected and
-  # the entrypoint ignores them. The container starts, and the failure is only
-  # visible in the log.
+function test_a_refused_service_enable_stops_the_container() {
+  # CHANGED by the entrypoint rewrite for issues #10 and #11. systemctl runs
+  # while systemd is not up yet -- it is started by the very next line -- so its
+  # refusals were expected, and the entrypoint ignored them : the container
+  # started, and the failure was one line in a log.
   #
-  # The cost of that choice is real : an "enable" that did not take leaves a
-  # container that comes up healthy with no OMSA in it. Whatever a later pull
-  # request decides to do about it, this is what the image does today
+  # The cost of that was the exact container this image exists to avoid. An
+  # "enable" that did not take leaves a container that comes up, reports itself
+  # healthy, answers nothing and has no OMSA in it, which is a far harder thing
+  # to diagnose than a container that refused to start. It is fatal now, and the
+  # message says what carrying on would have meant
   given_the_credentials "omsauser" "hunter2"
   export MOCK_SYSTEMCTL_EXIT_CODE=1
 
   run_entrypoint
 
-  assert_equals "0" "$ENTRYPOINT_EXIT_CODE" \
-    "a refused enable does not stop the container today"
-  assert_command_succeeds "and the handover happens anyway" the_entrypoint_reached_init
+  assert_not_equals "0" "$ENTRYPOINT_EXIT_CODE" \
+    "a refused enable should stop the container"
+  assert_contains "$ENTRYPOINT_OUTPUT" "rc-local.service" \
+    "and should say which unit it could not enable"
+  assert_command_fails "the handover should not happen on top of it" \
+    the_entrypoint_reached_init
+}
+
+function test_an_rc_local_that_cannot_be_written_stops_the_container() {
+  # The three links of the chain are only worth anything whole, and this is what
+  # issue #10 costs at the first of them : the write was not checked, so a
+  # container whose rc.local never got written came up with nothing starting
+  # OMSA and nothing in the log to say why.
+  #
+  # Made to fail with a directory in the file's place, which is also what a
+  # "-v /etc/rc.local:/etc/rc.local" typed against a path that does not exist
+  # leaves behind on the host
+  given_the_credentials "omsauser" "hunter2"
+  command -p mkdir -p "$(sandbox_path /etc/rc.local)"
+
+  run_entrypoint
+
+  assert_not_equals "0" "$ENTRYPOINT_EXIT_CODE" \
+    "an rc.local that could not be written should stop the container"
+  assert_not_empty "$ENTRYPOINT_OUTPUT" \
+    "and should say so rather than stopping silently"
+  assert_equals "0" "$(count_calls_matching systemctl '.')" \
+    "nothing should go on to enable the unit that would have run it"
+  assert_command_fails "and the handover should not happen on top of it" \
+    the_entrypoint_reached_init
+}
+
+function test_an_rc_local_that_cannot_be_made_executable_stops_the_container() {
+  # rc-local.service is "ConditionFileIsExecutable=/etc/rc.local" : a file
+  # without the bit is not an error, it is a unit that never runs and never
+  # complains. A chmod that did not take is therefore invisible in every log the
+  # container writes, which is exactly the shape of failure issue #10 is about
+  given_the_credentials "omsauser" "hunter2"
+  export MOCK_CHMOD_EXIT_CODE=1
+
+  run_entrypoint
+
+  assert_not_equals "0" "$ENTRYPOINT_EXIT_CODE" \
+    "an rc.local that could not be made executable should stop the container"
+  assert_not_empty "$ENTRYPOINT_OUTPUT" \
+    "and should say so rather than stopping silently"
+  assert_command_fails "the handover should not happen on top of it" \
+    the_entrypoint_reached_init
 }
