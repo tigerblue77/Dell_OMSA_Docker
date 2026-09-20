@@ -179,6 +179,13 @@ jobs:
           total_human=$(numfmt --to=iec-i --format='%.1f' --suffix=B "$total_bytes")
           echo "$IMAGE_TAG totals $total_human ($total_bytes bytes)"
 
+          # Also as an annotation, because the step summary is the one place this number
+          # cannot be read from : it is not in the job log, and the API that serves check
+          # runs does not serve summaries. An annotation is, so the size of a build is
+          # readable without opening a browser -- which is what makes #5 answerable from
+          # a run rather than from somebody's screenshot of one
+          echo "::notice title=Image size::$total_human ($total_bytes bytes), uncompressed"
+
           {
             echo "## Image size"
             echo
@@ -389,6 +396,68 @@ jobs:
           fi
 
           echo "The OMSA web server answered on port 1311."
+
+      # Issue #3 asks somebody to read /opt/dell/srvadmin/var/log/ and fix what is in it,
+      # and it has been open since March 2023 because reading it meant owning a PowerEdge,
+      # starting the container by hand and remembering to look. The container comes up here
+      # now, so the logs can be printed on every build instead -- which is the difference
+      # between a question somebody has to go and answer and one the next run answers by
+      # itself.
+      #
+      # NOT an assertion, deliberately, and this is the one place in this workflow where
+      # that is the right call. A runner is not a Dell server : OMSA will complain about
+      # hardware that is not there, and the modprobe line for dell_rbu is expected rather
+      # than a defect. Failing on the presence of an error would mean failing every build
+      # for the environment rather than for the image. What it is for is being read --
+      # and a line here that is NOT explained by the absence of hardware is a finding.
+      #
+      # "if: always()" so a failure upstream still yields the logs, which is when they are
+      # worth the most. The container may be gone by then, so every command is guarded.
+      - name: Collect OMSA's own logs
+        if: always()
+        run: |
+          if [ -z "$(docker ps --all --quiet --filter "name=^${WEB_SERVER_CONTAINER}$")" ]; then
+            echo "The container was never created, so there are no OMSA logs to read."
+            exit 0
+          fi
+
+          {
+            echo "## OMSA's own logs"
+            echo
+            echo "Read against issue #3. A GitHub runner is not a PowerEdge, so a complaint about absent hardware is the environment rather than a defect -- and anything here that is *not* explained by the absence of hardware is."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # "|| true" on the listing alone : an empty or missing log directory is a finding
+          # to report rather than a step to fail, and the loop below prints nothing in that
+          # case, which says it plainly enough
+          logs=$(docker exec "$WEB_SERVER_CONTAINER" \
+            find /opt/dell/srvadmin/var/log/ -type f -name '*.log' 2>/dev/null || true)
+
+          if [ -z "$logs" ]; then
+            echo "No .log file under /opt/dell/srvadmin/var/log/ -- which is itself worth knowing." \
+              | tee --append "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for log in $logs; do
+            echo "----- $log -----"
+            {
+              echo "<details><summary><code>$log</code></summary>"
+              echo
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            docker exec "$WEB_SERVER_CONTAINER" tail --lines=100 "$log" 2>&1 \
+              | tee --append "$GITHUB_STEP_SUMMARY"
+
+            {
+              echo '```'
+              echo
+              echo "</details>"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
 
       # Named containers outlive the step that created them when that step was
       # killed, and a self-hosted runner would keep them forever. Written as a
