@@ -1240,7 +1240,7 @@ print_report() {
 
 	out '## Dell OMSA container privilege probe'
 	out ''
-	out "Run on $(date -u '+%Y-%m-%d %H:%M:%S UTC') by \`tools/probe_container_privileges.sh\`, which starts the image under progressively narrower Docker configurations and records what still works. Issue #4."
+	out "Run on $(date -u '+%Y-%m-%d %H:%M:%S UTC') by \`tools/probe_container_privileges.sh\`, which starts the image under progressively narrower Docker configurations and records what still works. ShaneMcC/docker-omsa#33."
 	out ''
 	out "* Server: \`${HOST_VENDOR} ${HOST_PRODUCT}\`"
 	out "* Host kernel: \`${HOST_KERNEL}\`"
