@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
 if [ "" = "${OMSA_username}" -o "" = "${OMSA_password}" ]; then
 	echo "Please specify OMSA_username and OMSA_password env vars."
 	exit 1;

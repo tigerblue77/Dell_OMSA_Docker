@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
 FROM almalinux:latest
 
 LABEL org.opencontainers.image.authors="tigerblue77"
@@ -25,6 +28,12 @@ RUN dnf clean all
 
 # Prevent daemon helper scripts from making systemd calls
 ENV SYSTEMCTL_SKIP_REDIRECT=1
+
+# Ship the licence and the notices inside the image. AGPL-3.0 section 4 asks that
+# they travel with every copy conveyed, and an image is a copy. /licenses is where
+# the RHEL-family container tooling expects to find them, this image being built on
+# an EL base.
+COPY LICENSE LICENSE-COMMERCIAL.md NOTICE /licenses/
 
 # Copy Docker container's script to Docker image
 ADD configure_and_run_Dell_OMSA.sh /configure_and_run_Dell_OMSA.sh
