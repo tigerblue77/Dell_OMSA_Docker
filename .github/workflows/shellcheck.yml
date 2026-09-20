@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Shellcheck
+
+# Nothing in this repository linted anything before this workflow. The one shell file here is the image's
+# entrypoint : it runs as the container's first process, on a privileged container, against real server
+# hardware, and no test covers it. A mistake in it is found by the machine it was deployed on.
+#
+# The file list below is written out one name at a time rather than globbed, and that is the point of it
+# rather than an accident of there being only one today. A glob lints whatever it happens to match, so a
+# script that arrives in a shape the glob misses -- a different directory, no .sh suffix, the mocks-style
+# executable with no extension at all -- is analysed by nothing, and nothing says so. A named list cannot
+# fail that way : adding a second script and forgetting this file leaves the new script unlinted, but the
+# omission is a line missing from a list somebody reads, not a silence. This is the sibling repository's
+# convention (Dell_iDRAC_fan_controller_Docker), whose own workflow names ten files one by one for the same
+# reason, and whose test suite fails when a script in the tree is missing from the list.
+#
+# One honest difference from the sibling : there, tests/cases/10_shell_scripts.sh fails the suite when a
+# script in the tree is missing from this list. There is no test suite here, so nothing enforces it. The
+# list is guarded by review alone, and a second shell script arriving in this repository has to be added
+# here by hand.
+#
+# -x lets shellcheck follow "source" / "." directives into the files they name. The entrypoint sources
+# nothing today, so -x changes nothing now ; it is here so that the first script which does source
+# something is understood rather than reported as a pile of unknown identifiers.
+#
+# The shell dialect is NOT forced. shellcheck reads the shebang, and configure_and_run_Dell_OMSA.sh opens
+# with "#!/bin/sh", so it is checked as POSIX sh -- confirmed rather than assumed : a bashism planted in a
+# file with that shebang is reported as SC3030 "In POSIX sh, arrays are undefined", which is the SC3xxx
+# family shellcheck only emits when it is enforcing POSIX. So no "-s sh" is needed, and adding one would be
+# worse than redundant : it would keep checking the file as sh on the day somebody changes the shebang to
+# bash, and report every legitimate bashism as an error.
+#
+# There is deliberately no second job here trying to skip a lint the merged pull request already ran. The
+# sibling has one, and it earns its keep there against a large suite ; this lint is one file and finishes in
+# under a second, while the job that decides whether to skip it costs a checkout, several GitHub API calls
+# and a fetch. It would be slower than the thing it avoids, and it would be the part with failure modes.
+# It was considered and left out -- not forgotten, so please do not "restore" it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Lint the shell scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # shellcheck is preinstalled on the ubuntu-latest runner image, so there is no install step.
+      #
+      # The four exclusions belong to this invocation alone. They are NOT in a .shellcheckrc, and there is
+      # no .shellcheckrc in this repository at all : a code disabled in that file is disabled for every
+      # tool that reads it -- the editor extension, a developer's bare "shellcheck" run, every script added
+      # later -- and it is disabled somewhere the reader of the invocation cannot see. Keeping them here
+      # costs one line and keeps the exclusion in front of whoever is reading what actually runs.
+      #
+      # One of the four is permanent, because the rule does not apply :
+      #
+      #   SC2154  "OMSA_username / OMSA_password referenced but not assigned". They are the container's two
+      #           documented runtime variables, set with "docker run -e OMSA_username=..." (see README.md),
+      #           so nothing in the tree assigns them and nothing should. The three lines that trip this are
+      #           the script's opening guard, which exists precisely to check that the operator did set
+      #           them. shellcheck cannot see an environment, so it cannot tell this from a typo -- that is
+      #           the cost of the exclusion, and with one script reading two variables it is worth paying.
+      #
+      # The other three are real defects in configure_and_run_Dell_OMSA.sh, parked here so that this job is
+      # green the day it is merged. A lint that is red on arrival is a lint somebody turns off, and fixing
+      # the entrypoint is its own change with its own review -- it is not something to smuggle into the pull
+      # request that adds CI. From day one the job still blocks every NEW finding, which is most of its
+      # value. Each of these three comes straight back off in the pull request that fixes the line it names,
+      # and the fix is one line in every case :
+      #
+      #   SC2166  "[ p -o q ]" is not well defined -- POSIX leaves the result of a test with that many
+      #           arguments unspecified. Becomes [ -z "$a" ] || [ -z "$b" ].
+      #   SC2006  legacy backticks, which do not nest and mangle backslashes. Becomes $( ).
+      #   SC2002  "cat file | grep" spawns a process to do what grep does by reading the file itself.
+      #
+      # Nothing else is excluded. In particular the SC3xxx POSIX family stays on, which is the family that
+      # matters most here : this file runs under the image's /bin/sh, and a bashism that works on the
+      # maintainer's laptop is a container that will not start.
+      - name: Run shellcheck
+        run: |
+          shellcheck -x -e SC2154,SC2166,SC2006,SC2002 \
+            configure_and_run_Dell_OMSA.sh

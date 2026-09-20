@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# hadolint's configuration. It is read by .github/workflows/hadolint.yml and by a bare "hadolint Dockerfile"
+# run by hand, which is why both settings live here and not as inputs on the workflow step : a threshold
+# written into the workflow would mean a local run and CI disagreeing about what passes, and a linter that
+# says different things in the two places is one nobody runs locally.
+
+# Fail the build on warning and above. Info-level findings still print -- they are worth reading, and
+# DL3059 below is one -- but they do not block, so the build's red/green means "a warning or an error", not
+# "hadolint had an opinion".
+failure-threshold: warning
+
+# Every entry below carries its argument. An ignore with no reason beside it is indistinguishable from one
+# added to make a red build go away, and the next reader cannot tell which of the two it was looking at.
+#
+# There are two kinds here, and the difference is whether the entry is ever expected to leave:
+#
+#   PERMANENT  the rule does not apply to this image and will not while it is built this way.
+#   TEMPORARY  the rule is right and the Dockerfile is wrong. The fix belongs to the Dockerfile's own pull
+#              request, not to the one that added this linter -- so the defects hadolint already knows
+#              about are parked here and the job is green on arrival, blocking every NEW violation from day
+#              one. A lint that is red the day it merges is a lint somebody switches off. Each temporary
+#              entry is deleted by the pull request that fixes the line it names.
+
+ignored:
+  # ---- PERMANENT ----
+
+  # DL3041 "Specify version with dnf install -y <package>-<version>".
+  #
+  # Both dnf lines install from rolling repositories, and one of them is the reason this image exists.
+  # "wget perl passwd procps kmod" come from AlmaLinux's own repository ; "srvadmin-all" comes from Dell's
+  # DSU repository, which the bootstrap.cgi line adds and which carries only the current DSU release. A
+  # pinned srvadmin-all-X.Y.Z therefore stops resolving on the day Dell publishes the next one, and the
+  # build fails with "no match for argument" -- not at some later upgrade, but on the very next rebuild.
+  # The image is packaging of current OMSA for current AlmaLinux; pinning the packages inside it would
+  # freeze the one thing it is for, while the base image underneath it went on moving anyway.
+  #
+  # The pin genuinely worth having here is the base image's, and that is DL3007 below -- a temporary entry,
+  # not a permanent one. This is not "we do not pin in this repository".
+  #
+  # Worth knowing before anybody revisits this : the upstream project takes the opposite view and pins
+  # srvadmin-all-11.1.0.0-5773.el9 outright. That is more defensible than it used to be, OMSA having shipped
+  # its final release in September 2024 -- a repository with no next version cannot move out from under a
+  # pin. It is a judgement call rather than a settled one, and if it is revisited, it is this entry that
+  # goes rather than this file's convention.
+  - DL3041
+
+  # ---- TEMPORARY : real defects in the Dockerfile, each waiting on its own fix ----
+
+  # DL3007 "Using latest is prone to errors if the image will ever update".
+  #
+  # FROM almalinux:latest. Two images built from this tree a month apart are different images published
+  # under the same tag, and nothing records which AlmaLinux any published build actually used -- so a
+  # regression reported against tigerblue77/Dell_OMSA:latest cannot be reproduced from the repository.
+  #
+  # It costs something measurable besides: .github/dependabot.yml declares a "docker" ecosystem on a daily
+  # schedule, and with no version on the only FROM line in the tree there is nothing for Dependabot to
+  # compare against. That entry has been running every day and has never had anything to propose. Pinning
+  # the base image is what turns it on.
+  - DL3007
+
+  # DL3020 "Use COPY instead of ADD for files and folders".
+  #
+  # hadolint's only error-level finding here. ADD configure_and_run_Dell_OMSA.sh does more than copy : it
+  # also auto-extracts a local archive and, historically, fetched remote URLs. COPY does the one thing
+  # meant, and the change is one word.
+  - DL3020
+
+  # DL4006 "Set the SHELL option -o pipefail before RUN with a pipe in it".
+  #
+  # RUN wget -q -O - https://linux.dell.com/repo/hardware/dsu/bootstrap.cgi | bash
+  #
+  # Under the default /bin/sh -c the pipeline's status is bash's alone, so wget returning a 404 page, or a
+  # transfer cut off mid-stream, feeds bash a truncated script. bash runs the fragment it got, exits 0, and
+  # the layer is committed with Dell's repository half-added or not added at all. The build then fails
+  # several instructions later, at "dnf -y install srvadmin-all", pointing at the wrong line. Piping a
+  # remote script into a shell is where this matters most, not least.
+  - DL4006
+
+  # DL3040 "dnf clean all missing after dnf command".
+  #
+  # The Dockerfile does clean, but three RUN instructions later. Each RUN commits its own layer first, so
+  # the cache and metadata are already baked into the image by then and the later clean only removes them
+  # from the final layer's view of the filesystem. The bytes ship either way.
+  - DL3040
+
+  # DL3025 "Use arguments JSON notation for CMD and ENTRYPOINT arguments".
+  #
+  # CMD /configure_and_run_Dell_OMSA.sh is in shell form, so it runs as "/bin/sh -c '<the script>'".
+  #
+  # hadolint's own rationale is that this leaves a shell as PID 1 and the entrypoint as its child, so the
+  # SIGTERM "docker stop" sends never reaches the process that should handle it. On THIS image, today, that
+  # is not what happens -- and the correction is worth writing down, because it cuts the other way.
+  #
+  # Measured, not assumed. bash optimises "-c" with a single simple command into a bare exec and leaves no
+  # process in between ; dash forks and sits between :
+  #
+  #   bash -c '/tmp/p.sh'   ->  script pid 2342, ppid 2338   (2338 is the CALLING shell : bash never forked)
+  #   dash -c '/tmp/p.sh'   ->  script pid 2345, ppid 2344   (2344 is the dash itself : it forked)
+  #
+  # /bin/sh on AlmaLinux is bash, so the entrypoint really does become PID 1 here, its "exec /sbin/init"
+  # really does make systemd PID 1, and docker stop really does reach it.
+  #
+  # /bin/sh on Debian and Ubuntu is dash. So the day the base image moves -- which is exactly what #9 and #5
+  # are about -- an intermediate shell appears, SIGTERM lands on it instead of on systemd, and the container
+  # starts being killed on the ten-second timeout rather than shut down, with nothing to announce it.
+  #
+  # The JSON-array form is therefore not tidying-up : it is what makes the signal path independent of which
+  # shell the base image happens to ship, and it should land BEFORE anything touches the base image.
+  - DL3025
+
+# Deliberately NOT ignored, and worth saying so because it does appear in the job's output:
+#
+#   DL3059 "Multiple consecutive RUN instructions. Consider consolidation." -- info level, on three lines.
+#   Real (each RUN is a layer, and this Dockerfile has six in a row), but it does not block at the
+#   threshold above, and squashing them is entangled with the DL3040 fix rather than separate from it.
+#   It prints on every run as a standing reminder, which is what info level is for.
