@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Hadolint
+
+# Lints the Dockerfile, which until this workflow was checked by nothing except whether it built. Building
+# is a weak test : every finding hadolint reports on this tree today builds perfectly well and is wrong
+# anyway -- an unpinned base image, a remote script piped into bash with no pipefail, a CMD that cannot
+# receive SIGTERM.
+#
+# What is and is not ignored, and the argument for each, is in .hadolint.yaml. The threshold lives there
+# too rather than as a "failure-threshold:" input on the step below, so that a developer running "hadolint
+# Dockerfile" by hand gets exactly the verdict CI gets. Two copies of a threshold is two things to keep in
+# agreement, and the one that drifts is always the local one.
+#
+# That needs one non-obvious fact stated, because the step below looks like it contradicts it. The action
+# ALWAYS exports HADOLINT_FAILURE_THRESHOLD, at its own input default of "info", whether or not the input
+# is given -- so it looks as though the config file's "warning" is being overridden and the three
+# info-level DL3059 findings would fail the build. They do not. hadolint 2.15.1's precedence is
+# CLI > config file > environment, not the usual environment-over-file, so the config file wins over the
+# action's exported default. Measured against the pinned action's own hadolint binary, with exactly this
+# Dockerfile and this config : config "warning" + HADOLINT_FAILURE_THRESHOLD=info exits 0, and the same
+# threshold passed on the CLI instead exits 1.
+#
+# So do NOT "fix" this by adding "failure-threshold: warning" to the step's "with:" block. It would be a
+# second copy of a value that already works, and it would put the number CI enforces somewhere a local run
+# cannot see it. If a future hadolint ever flips that precedence, this job goes red on DL3059 -- loudly,
+# on the next pull request, with the rule named in the log -- which is the failure mode to prefer.
+#
+# Same shape as .github/workflows/shellcheck.yml, and for the same reasons : push on master, every pull
+# request, and workflow_dispatch so it can be run by hand after editing .hadolint.yaml. No job trying to
+# detect that a merged pull request already linted this tree -- see that file's header for why the
+# bookkeeping would cost more than the lint it skipped.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    name: Lint the Dockerfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Pinned to v3.5.0 and not to a moving "v3", because hadolint/hadolint-action publishes no such tag.
+      # Checked rather than assumed, against the repository's own refs : the tags are v1.0.0 ... v1.7.0,
+      # v2.0.0, v2.1.0, v3.0.0 ... v3.5.0, and "git ls-remote refs/tags/v3" returns nothing. A "@v3" here
+      # would not float, it would fail to resolve and the job would never run. v3.5.0 is the current
+      # release of the current major.
+      #
+      # This is also why the action wants watching by hand : .github/dependabot.yml declares only a
+      # "docker" ecosystem, so nothing bumps the actions referenced by any workflow in this repository.
+      #
+      # "config" is passed explicitly rather than left to hadolint's own discovery. The action runs hadolint
+      # inside a container with the workspace mounted, and being explicit means the file that is read is the
+      # one named here rather than whichever the working directory happened to yield.
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
