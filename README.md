@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
 # Dell_OMSA_Docker
 
 Dell OpenManage Server Administrator in Docker.
