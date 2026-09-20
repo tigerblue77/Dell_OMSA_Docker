@@ -268,7 +268,7 @@ OMSA reads the storage controller through `srvadmin-storage` and the vendor libr
 
 ### The image is older than you expect
 
-The published image is rebuilt when a release is tagged, not when Dell publishes a package. If you want the current OMSA rather than the one that was current when the image was built, rebuild it yourself:
+The published image is rebuilt when this repository publishes, not when Dell publishes a package — so the OMSA inside it is whichever was current on the day it was built, and Dell has moved since. If you want the current one, rebuild it yourself:
 
 ```bash
 git clone https://github.com/tigerblue77/Dell_OMSA_Docker.git
