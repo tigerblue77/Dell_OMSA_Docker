@@ -1,0 +1,134 @@
+Dell OMSA Docker image
+======================
+
+Copyright (C) 2020-2026 Tigerblue77 and the Dell OMSA Docker image
+contributors.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3, as
+published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
+General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full licence text is in the LICENSE file next to this one.
+
+A separate commercial licence is available for parties who cannot meet
+the obligations of the AGPL. See LICENSE-COMMERCIAL.md. Which of the two
+applies is the recipient's choice: taking the program under the AGPL
+requires no permission, no registration and no notice to anyone.
+
+
+Upstream material, and the one thing this notice cannot settle
+--------------------------------------------------------------
+
+This repository is a fork of ShaneMcC/docker-omsa
+<https://github.com/ShaneMcC/docker-omsa>, written by Shane Mc Cormack
+between March 2020 and February 2022.
+
+**That repository carries no licence statement**: no LICENSE file, no
+notice in its README, nothing in its commit history. Under the Berne
+Convention and the copyright law of essentially every jurisdiction, work
+published without a licence is not thereby placed in the public domain —
+the author keeps every exclusive right, and a downstream recipient holds
+no grant to redistribute or relicense it.
+
+The AGPL grant stated above is therefore made by Tigerblue77 over the
+parts of this work that are Tigerblue77's own, which today is most of
+it. What survives from upstream, measured with `git blame -C -C -C`
+against the commit this notice was written at, is:
+
+  Dockerfile                        13 lines of 33
+  configure_and_run_Dell_OMSA.sh    13 lines of 44, plus the order and
+                                    the shape of the whole script, which
+                                    are upstream's even where no single
+                                    line is
+  README.md                         20 lines of 33
+
+Those lines, and the structure they sit in, remain Shane Mc Cormack's,
+and no amount of relicensing by this fork changes that. They are kept
+here under the same absence of terms they were published under, with
+attribution preserved, and they are explicitly **not** covered by either
+arm of this project's dual licence: the commercial arm in particular can
+only ever cover what this project holds or is authorised to sublicense.
+
+Resolving this properly means one of two things, and it is being pursued
+rather than left implicit:
+
+  * Shane Mc Cormack agreeing to license his contribution under the
+    AGPL, which would settle it outright; or
+  * the remaining upstream lines being replaced by work this project
+    owns, at which point this section becomes a historical note.
+
+The tracking issue is referenced from the repository's issue list. Until
+one of the two lands, a recipient's position with respect to those
+specific lines is exactly what it was before this notice existed:
+unlicensed, and relied on at the recipient's own assessment. Nothing
+here makes it worse, and pretending the question away would have.
+
+
+Third-party material inside the published image
+-----------------------------------------------
+
+The Docker image this repository publishes contains software that this
+project neither wrote nor distributes in source form here. The two that
+matter to anybody redistributing the image are:
+
+  * **Dell OpenManage Server Administrator** (the `srvadmin-*` packages),
+    installed at build time from Dell's own repository at
+    <https://linux.dell.com/repo/hardware/>. It is proprietary software,
+    governed by the Dell End User License Agreement that accompanies it,
+    and it is the reason this image exists at all. This project holds no
+    right to relicense it, states none, and grants none: the AGPL above
+    covers the scripts in this repository, never the Dell packages the
+    image installs. Anyone redistributing the built image is
+    redistributing Dell's software and is bound by Dell's terms for it,
+    independently of anything this project says.
+
+  * the **base image** and the distribution packages it carries
+    (`perl`, `passwd`, `procps-ng`, `kmod` and their dependencies), each
+    under its own licence, most of them GPL or permissive.
+
+They are aggregated with this program, not derived from it, and their
+terms are the ones shipped inside the image itself.
+
+
+Licence history
+---------------
+
+A downstream recipient needs to be able to reconstruct which terms
+applied when, so the chain is recorded here rather than only in the git
+history:
+
+  2020-03-08 .. 2026-09-20   No licence.
+                             Neither the upstream project nor this fork
+                             carried one. Contributions from that period
+                             were therefore not made under any stated
+                             licence, and copies obtained during it came
+                             with no grant at all.
+
+  2026-09-20 onwards         GNU Affero General Public License v3.0 only
+                             (AGPL-3.0-only), plus a separate commercial
+                             licence, for the parts of the work this
+                             project owns. See the section above for the
+                             parts it does not.
+
+
+Attribution
+-----------
+
+Attribution is a licence obligation here, not a courtesy: AGPL-3.0
+sections 5(a) and 7(b) require the legal notices and the author
+attributions to be preserved in modified versions. Keeping this file, the
+LICENSE file and the SPDX headers in the source files intact is what
+satisfies them.
+
+The people who wrote this program are listed in the repository's commit
+history, which is the authoritative record:
+
+    git shortlog -sne
