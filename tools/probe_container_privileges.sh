@@ -223,6 +223,8 @@ readonly RUNG_IDS=(
 	12-caps3-only
 	13-admin-only
 	14-nothing
+	15-admin-cgroupfs
+	16-admin-cgroupfs-unconfined
 )
 
 # The control: the recipe the README tells people to use today. Everything else
@@ -245,6 +247,8 @@ rung_label() {
 	12-caps3-only) printf '%s\n' 'RAWIO+ADMIN+MODULE, no device, no mounts' ;;
 	13-admin-only) printf '%s\n' 'SYS_ADMIN alone, no device, no mounts' ;;
 	14-nothing) printf '%s\n' 'nothing at all (negative control)' ;;
+	15-admin-cgroupfs) printf '%s\n' 'ADMIN + writable cgroupfs + tmpfs /run' ;;
+	16-admin-cgroupfs-unconfined) printf '%s\n' 'as 15, plus seccomp and apparmor unconfined' ;;
 	esac
 }
 
@@ -266,6 +270,8 @@ rung_rationale() {
 	11-ipmi) printf '%s\n' 'The configuration lovoo/ipmi_exporter issue #9 tried and could not make work. Measuring it here settles what it does and does not buy.' ;;
 	12-caps3-only) printf '%s\n' 'The first of two rungs that ask about systemd rather than about OMSA, and the only pair in this ladder that needs no Dell hardware at all: no device node, no bind mount, nothing the machine has to own. The maintainer reported the container looping without --privileged, and his logs show the entrypoint completing before it restarts, so it is systemd as PID 1 that is failing. Whether these three capabilities are enough for it is answerable on any host with a Docker daemon, including a virtual machine.' ;;
 	13-admin-only) printf '%s\n' 'The same question with only SYS_ADMIN, which is the capability systemd is usually said to want. If this starts and rung 12 does too, the looping has a one-flag answer and it is separable from anything OMSA needs.' ;;
+	15-admin-cgroupfs) printf '%s\n' 'Rungs 12 to 14 established that no capability set starts systemd, and the container log shows it dying without printing anything -- which is what a process does when it cannot build its environment, not when it is refused a permission. This rung gives it the environment instead of the capability: a writable cgroup filesystem, which an unprivileged container on cgroup v2 does not get, and tmpfs for /run and /run/lock. If systemd comes up here, the answer to the looping is a mount configuration rather than --privileged.' ;;
+	16-admin-cgroupfs-unconfined) printf '%s\n' 'The same with seccomp and apparmor unconfined, which is the other half of what --privileged relaxes. If 15 fails and this passes, the blocker is a filtered syscall rather than a missing mount, and the answer is narrower than --privileged but not by much.' ;;
 	14-nothing) printf '%s\n' 'The negative control. Whatever passes here passes with no hardware access whatsoever, so the same pass higher up the ladder is not evidence of anything.' ;;
 	esac
 }
@@ -332,6 +338,20 @@ rung_docker_arguments() {
 		printf '%s\n' '--cap-add' 'SYS_ADMIN'
 		;;
 	14-nothing) ;;
+	15-admin-cgroupfs)
+		printf '%s\n' '--cap-add' 'SYS_ADMIN'
+		printf '%s\n' '--volume' '/sys/fs/cgroup:/sys/fs/cgroup:rw'
+		printf '%s\n' '--tmpfs' '/run'
+		printf '%s\n' '--tmpfs' '/run/lock'
+		;;
+	16-admin-cgroupfs-unconfined)
+		printf '%s\n' '--cap-add' 'SYS_ADMIN'
+		printf '%s\n' '--volume' '/sys/fs/cgroup:/sys/fs/cgroup:rw'
+		printf '%s\n' '--tmpfs' '/run'
+		printf '%s\n' '--tmpfs' '/run/lock'
+		printf '%s\n' '--security-opt' 'seccomp=unconfined'
+		printf '%s\n' '--security-opt' 'apparmor=unconfined'
+		;;
 	esac
 }
 
