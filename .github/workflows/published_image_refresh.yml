@@ -30,6 +30,18 @@ name: Published image refresh
 # here is exactly the source of the last release, only the base underneath it is
 # newer.
 #
+# The two watches are read in two separate jobs, in this order, and the split is
+# load-bearing rather than tidy. "dell" asks Dell's repository a question that
+# needs no registry, no credentials and no published image ; "check" reads the
+# registries and decides what follows from the answer. They used to be one job,
+# and every way that job could fail - a deleted version tag, a GHCR permission
+# blip, a Docker Hub rate limit - took the Dell watch down with it, silently,
+# because the step that reads Dell sat after the steps that read registries and
+# the job that reports Dell sat behind a plain "needs". The one watch that has
+# ever caught anything here was the one that stopped first. Read separately,
+# Dell's answer survives every registry failure, and "report-dell-drift" below
+# spells out exactly which part of it is still worth believing when it does.
+#
 # /!\ Like every scheduled workflow, this one only runs once it is on the
 # default branch. GitHub also disables scheduled workflows in a public
 # repository after 60 days without activity, and they then have to be re-enabled
@@ -49,18 +61,348 @@ on:
 permissions:
   contents: read
 
-# Two overlapping runs would race to push the same "latest" tag, and two
-# overlapping runs would each open the same Dell drift issue
+# The same group name as "Docker image CI", spelled identically on purpose. A
+# concurrency group is repository-wide and matched on its name alone, so this
+# line is the whole mechanism : it is what stops a release and a refresh from
+# publishing "latest" at the same time.
+#
+# With a group of its own - "published-image-refresh", which is what was here -
+# two refreshes were serialised against each other and nothing was serialised
+# against a release. The sequence that leaves : the check job below decides to
+# rebuild from v1.0 and starts a ten-minute build, the maintainer pushes v1.1,
+# the release publishes v1.1 and moves "latest" onto it, and then this rebuild
+# finishes and pushes its own "latest", built from v1.0, over the top. "latest"
+# serves the PREVIOUS release. The next night repairs it - unless Dell has moved
+# too, in which case the rebuild is blocked and the wrong "latest" stays.
+#
+# Sharing the group also puts the CHECK inside the serialised region, which is
+# the half a job-level group would not buy : whatever this run reads out of the
+# registry cannot be changed by a release while it is deciding what to do with
+# it. The cost is that a release pushed during a refresh waits for it - minutes,
+# and the refresh is usually a read and nothing else - and that a third run
+# queued behind a running one and a waiting one cancels the waiting one. The
+# rebuild job below re-checks the registry immediately before it pushes anyway,
+# because a group cannot serialise this against a "docker push" typed by hand
 concurrency:
-  group: published-image-refresh
+  group: publish-docker-image
   cancel-in-progress: false
 
 env:
   DELL_REPOSITORY_URL: https://linux.dell.com/repo/hardware/dsu/os_dependent
 
 jobs:
+  # What is watched in Dell's repository, and what is deliberately not.
+  #
+  # The srvadmin/ TREE for the EL major the Dockerfile pins, because its
+  # absence is the failure that went unnoticed for three and a half years.
+  # Dell publishes racadm and DSU for every OS it supports and srvadmin/ only
+  # where OMSA exists : os_dependent/RHEL10_64/ has metaRPMS/, racadm/ and
+  # repodata/ and no srvadmin/ at all, where RHEL8_64/ and RHEL9_64/ have
+  # both. An image whose base moved to an EL major without that tree gets a
+  # repository that resolves perfectly and has no srvadmin-all in it.
+  #
+  # The VERSION of srvadmin-all, because that is the package the Dockerfile
+  # installs and therefore the one number that describes this image's payload.
+  #
+  # Nothing else, and the omissions are the design. NOT the thirty component
+  # RPMs under srvadmin/ nor the nine other meta-RPMs beside srvadmin-all :
+  # they move on their own schedules - srvadmin-idrac sits on 11.4.0.0-1435
+  # today where everything else is on 11.1.0.0-5773 - so watching them would
+  # fire on changes that never reach this image. NOT the repodata, which is
+  # regenerated on syncs that changed no package. NOT the directory
+  # timestamps, which all carry the same value to the minute across every OS
+  # directory, because that is a mirror sync touching all of them rather than
+  # Dell publishing anything. A check that fires every week on something
+  # nobody has to act on is a check people learn to close unread, and then it
+  # is worth less than no check at all - the one that matters here fires
+  # about once a year.
+  #
+  # This job reads no registry and holds no credentials, which is the point of
+  # it being a job : everything it needs is in the checkout. What it answers is
+  # therefore still answered on a morning when GHCR refuses a token, when Docker
+  # Hub has spent this runner's quota, or when a version tag has been deleted
+  # from under the check job below - all three of which used to end this
+  # workflow before Dell was ever contacted
+  dell:
+    name: Read Dell's repository
+    runs-on: ubuntu-latest
+    # The fetch ladder retries three times ten seconds apart on each of two
+    # URLs, so a minute and a half of this can be spent waiting on a server that
+    # answers slowly. Ten bounds a wedged job without ever being reached by a
+    # healthy one
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.dell.outputs.status }}
+      version: ${{ steps.dell.outputs.version }}
+      el-major: ${{ steps.el.outputs.major }}
+      source: ${{ steps.el.outputs.source }}
+    steps:
+      # The whole history, tags included : the version tags are what the step
+      # below picks the source to read out of
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Work out which EL major to ask Dell about
+        id: el
+        run: |
+          set -euo pipefail
+
+          # The highest version tag in GIT, and deliberately not the highest one
+          # that resolves in the registry the way the check job below picks its
+          # release. The two questions are different : "which image does latest
+          # belong to" is about what was published and can only be answered by a
+          # registry, while "which of Dell's trees is this source built against"
+          # is a property of the source and is readable from the checkout alone.
+          # Reading it from git is what keeps this job free of every registry,
+          # which is the whole reason it is a job. In the normal case the two
+          # agree ; when they do not, the check job below notices and refuses to
+          # act on this answer rather than acting on the wrong tree.
+          #
+          # Filtered through the same two shapes "Docker image CI" triggers on,
+          # so a "v2.0-rc1" sitting in git is not mistaken for a release : a tag
+          # that workflow cannot publish is not the source this image is built
+          # from
+          CANDIDATES="$(git tag --list 'v[0-9]*.[0-9]*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$')" || true
+          # The first line, taken with a parameter expansion rather than by
+          # piping into "head -n 1" : head closes the pipe on the line it wants,
+          # grep takes a SIGPIPE for the rest, and under "pipefail" that is a
+          # failed pipeline whose "|| true" would quietly leave this empty
+          TAG="${CANDIDATES%%$'\n'*}"
+
+          if [ -n "$TAG" ]; then
+            DOCKERFILE="$(git show "$TAG:Dockerfile")"
+            SOURCE="$TAG"
+          else
+            DOCKERFILE="$(cat Dockerfile)"
+            SOURCE="the working tree"
+          fi
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+
+          # The same parser as everywhere else, minus the question of which
+          # shape it found : whether the base is named on an ARG or on the FROM
+          # line decides whether a REBUILD can pin it, and nothing here is
+          # rebuilt. All this job needs is the reference, to read an EL major
+          # off its tag
+          BASE_IMAGE="$(printf '%s\n' "$DOCKERFILE" | awk '
+            toupper($1) == "ARG" {
+              eq = index($2, "=")
+              if (eq > 1) default_of[substr($2, 1, eq - 1)] = substr($2, eq + 1)
+            }
+            toupper($1) == "FROM" {
+              ref = $2
+              if (ref ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) {
+                name = ref
+                gsub(/^\$\{?|\}$/, "", name)
+                ref = default_of[name]
+              }
+              print ref
+              exit
+            }')"
+          if [ -z "$BASE_IMAGE" ]; then
+            echo "::error::Could not work out the base image from the Dockerfile of $SOURCE"
+            exit 1
+          fi
+
+          # Same last-path-segment rule as everywhere else : a colon only
+          # introduces a tag in the last segment, in "registry:5000/image" it is
+          # a host and a port
+          REF="${BASE_IMAGE%%@*}"
+          case "${REF##*/}" in
+            *:*) BASE_TAG="${REF##*:}" ;;
+            *)   BASE_TAG="" ;;
+          esac
+          EL_MAJOR="${BASE_TAG%%.*}"
+          if printf '%s' "$EL_MAJOR" | grep -qE '^[0-9]+$'; then
+            echo "Asking Dell about EL$EL_MAJOR, read off '$BASE_IMAGE' in $SOURCE"
+            echo "major=$EL_MAJOR" >> "$GITHUB_OUTPUT"
+          else
+            # A base pinned straight to a digest lands here, and so does
+            # "almalinux:latest" - which is what master carried while this image
+            # was quietly unbuildable, because nobody can say which of Dell's
+            # trees such an image is supposed to resolve against. With the
+            # Dockerfile this pipeline requires, an ARG naming an EL major, this
+            # branch is not reached and the Dell watch is live from the first
+            # night, before any release exists
+            echo "::warning::Could not work out which EL major '$BASE_IMAGE' is, so Dell's repository cannot be checked. Pin the base to an EL major"
+            echo "major=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read Dell's repository
+        id: dell
+        run: |
+          set -euo pipefail
+          EL_MAJOR="${{ steps.el.outputs.major }}"
+
+          if [ -z "$EL_MAJOR" ]; then
+            # Warned about in the step above, where the reason lives
+            echo "status=undetermined" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OS_DIRECTORY_URL="$DELL_REPOSITORY_URL/RHEL${EL_MAJOR}_64"
+
+          # The status code is asked for explicitly, and "--fail" is dropped,
+          # because --fail folds every HTTP answer from 400 upwards into the one
+          # exit code 22 - and the two answers hiding in there owe the reader
+          # opposite things. A 404 on RHEL9_64/ is Dell having removed the tree,
+          # which is the same fact as a missing href="srvadmin/" one level down
+          # and wants the same issue ; a 503 is Dell having a bad night, which
+          # wants silence and one lost night. Retries still happen without
+          # --fail : curl's own transient-error list is 408, 429 and 500/502/503/
+          # 504, which is exactly the set that deserves them.
+          # RHEL7_64 is already a live 404 today against RHEL9_64's 200, so the
+          # day the pinned major goes the same way is a question of when, not if
+          BODY="$RUNNER_TEMP/dell-index"
+          fetch() {
+            local HTTP_CODE
+            HTTP_CODE="$(curl --silent --show-error --location \
+                              --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors \
+                              --output "$BODY" --write-out '%{http_code}' "$1")" || HTTP_CODE=000
+            printf '%s' "$HTTP_CODE"
+          }
+
+          HTTP_CODE="$(fetch "$OS_DIRECTORY_URL/")"
+          case "$HTTP_CODE" in
+            2??)
+              INDEX="$(cat "$BODY")"
+              ;;
+            404 | 410)
+              # Dell answered, and its answer was that the tree is not there.
+              # Reported rather than swallowed : an image held back from every
+              # rebuild by something nobody is told about is a "latest" that
+              # quietly stops being refreshed, which is the shape of the defect
+              # this whole workflow exists to have caught
+              echo "::error::$OS_DIRECTORY_URL/ answered HTTP $HTTP_CODE : Dell no longer publishes a tree for EL$EL_MAJOR"
+              echo "status=missing" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              # "The server did not answer" is not "Dell removed it", and the two
+              # are never allowed to look alike here. An unreadable repository
+              # opens no issue and - see the comparison below - permits no rebuild
+              # either, because a rebuild resolves its packages from this same
+              # server and nobody can say what it would install. It costs one
+              # night, and the run says why
+              echo "::warning::$OS_DIRECTORY_URL/ answered '$HTTP_CODE', so nothing can be said about Dell's repository today"
+              echo "status=unknown" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          # The index has to prove it parses before its silence is allowed to
+          # mean anything. "Dell dropped OMSA for EL$EL_MAJOR" was decided by
+          # one substring not being found, and that substring is only right for
+          # as long as this server serves relative hrefs : one Apache directive
+          # away - "srvadmin/" written out as
+          # "/repo/hardware/dsu/os_dependent/RHEL9_64/srvadmin/" - the test
+          # below finds nothing in a tree where everything is still there, and
+          # the issue this workflow then opens says Dell no longer publishes
+          # OMSA, in those words, with total confidence. racadm/ and repodata/
+          # are present in every one of these OS directories INCLUDING the EL10
+          # one that genuinely has no srvadmin/, so they tell "we cannot read
+          # this" apart from "it is not there" without weakening the real test
+          if ! printf '%s' "$INDEX" | grep -qE 'href="(racadm|repodata)/"'; then
+            echo "::warning::$OS_DIRECTORY_URL/ carries neither href=\"racadm/\" nor href=\"repodata/\", so it is not the directory index this workflow knows how to read and nothing can be concluded from it"
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! printf '%s' "$INDEX" | grep -q 'href="srvadmin/"'; then
+            echo "::error::$OS_DIRECTORY_URL/ carries no srvadmin/ tree"
+            echo "status=missing" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HTTP_CODE="$(fetch "$OS_DIRECTORY_URL/metaRPMS/")"
+          case "$HTTP_CODE" in
+            2??)
+              META_INDEX="$(cat "$BODY")"
+              ;;
+            404 | 410)
+              echo "::error::$OS_DIRECTORY_URL/metaRPMS/ answered HTTP $HTTP_CODE, so there is no srvadmin-all to install for EL$EL_MAJOR"
+              echo "status=missing" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "::warning::$OS_DIRECTORY_URL/metaRPMS/ answered '$HTTP_CODE', so nothing can be said about Dell's repository today"
+              echo "status=unknown" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          # The same guard the OS directory above carries, for the same reason
+          # and one level down : "no srvadmin-all here" is decided by a relative
+          # href not matching, so the index has to prove it serves relative hrefs
+          # before its silence is allowed to mean anything. Any .rpm at all does
+          # it - this directory holds eleven meta packages and has never held
+          # none - without weakening the real test, which is about one of them
+          if ! printf '%s' "$META_INDEX" | grep -qE 'href="[^"/]+\.rpm"'; then
+            echo "::warning::$OS_DIRECTORY_URL/metaRPMS/ carries no relative href to any .rpm, so it is not the directory index this workflow knows how to read and its silence about srvadmin-all means nothing"
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Anchored on href= rather than on the link text : Apache truncates a
+          # long file name in the text it displays and leaves the href intact.
+          #
+          # The digit immediately after the prefix is what makes this a VERSION
+          # match rather than a name match. "[^\"]+" also matches a letter, so
+          # "srvadmin-all-debuginfo-11.9.0.0-1.el9.x86_64.rpm" - a sibling of
+          # exactly the shape Dell already ships as srvadmin-storageservices-cli
+          # and srvadmin-server-snmp - parsed as the version
+          # "debuginfo-11.9.0.0-1.el9", and sort -V ranks anything starting with
+          # a letter above every numeric version, so the garbage did not just
+          # get considered, it always won. Compared against the label on the
+          # published image, it reads as drift : an issue every morning naming a
+          # version that does not exist, and every refresh of "latest" held
+          # behind it. Source RPMs are dropped for the same reason : ".src.rpm"
+          # is not this image's payload and one published ahead of the binary
+          # would outrank it. The architecture itself is deliberately NOT
+          # constrained - every package in this tree is x86_64 today, and
+          # demanding it would turn a Dell restructuring into a false "Dell
+          # dropped OMSA"
+          VERSION="$(printf '%s' "$META_INDEX" \
+            | grep -oE 'href="srvadmin-all-[0-9][^"]*\.rpm"' \
+            | grep -vE '\.src\.rpm"$' \
+            | sed -E 's/^href="srvadmin-all-//; s/\.[A-Za-z0-9_]+\.rpm"$//' \
+            | sort -V | tail -n 1)" || true
+
+          if [ -z "$VERSION" ]; then
+            # The tree is there and srvadmin-all is not : Dell has restructured
+            # something. The same annotation level as the missing tree above,
+            # because it is the same fact - the image cannot be built - and the
+            # two must not look like different sizes of problem. Both leave the
+            # run green : the issue opened below is the channel, and a job that
+            # goes red every morning until somebody acts is a job people stop
+            # opening
+            echo "::error::Found no srvadmin-all package in $OS_DIRECTORY_URL/metaRPMS/"
+            echo "status=missing" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Dell publishes srvadmin-all $VERSION for EL$EL_MAJOR"
+          # Whether that is a change is decided in the comparison below, which is
+          # where the published image is read
+          echo "status=present" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check whether anything this image is built from has moved
+    needs: dell
     runs-on: ubuntu-latest
     # The retry ladder on the base image digest sleeps 60s and then 300s before
     # its last attempt, so six minutes of this can be spent waiting on purpose,
@@ -80,14 +422,14 @@ jobs:
       base-image: ${{ steps.base.outputs.image }}
       base-digest: ${{ steps.base.outputs.digest }}
       base-pinned: ${{ steps.base.outputs.pinned }}
-      el-major: ${{ steps.base.outputs.el-major }}
-      dell-version: ${{ steps.dell.outputs.version }}
-      # Read off "compare" and not off "dell" : the step below can only say what
-      # Dell serves today, and whether that is a CHANGE is a question about the
-      # published image, which only the comparison has read. So "dell" answers
-      # "present", and "compare" turns that into "unchanged" or "moved"
+      # Read off "compare" and not off the "dell" job : that job can only say
+      # what Dell serves today, and whether that is a CHANGE is a question about
+      # the published image, which only the comparison has read. So "dell"
+      # answers "present", and "compare" turns that into "unchanged" or "moved"
       dell-status: ${{ steps.compare.outputs.status }}
-      published-omsa-version: ${{ steps.compare.outputs.published-omsa-version }}
+      baseline-omsa-version: ${{ steps.compare.outputs.baseline-omsa-version }}
+      baseline-source: ${{ steps.compare.outputs.baseline-source }}
+      latest-digest: ${{ steps.compare.outputs.latest-digest }}
     steps:
       # The whole history, tags included : the version tags are the candidate
       # list the current release is picked out of
@@ -106,6 +448,22 @@ jobs:
           # there : everything below reads a registry by hand, and registry APIs
           # reject the repository's own capitalisation
           echo "value=${FINAL_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      # Before the base image is resolved, and for the reason "Docker image CI"
+      # states beside the same call : the base lives on Docker Hub, anonymous
+      # requests there are rate limited per IP, and GitHub's runners share
+      # theirs. This job used to resolve it anonymously while the very
+      # credentials it needed were sitting in the secrets the rebuild job below
+      # uses, so on a morning when the shared address was over quota the retry
+      # ladder burned six minutes and failed - and a failed check job took the
+      # Dell watch down with it. It no longer can, since "dell" runs before this
+      # and beside it, but a daily job that fails on somebody else's pulls is
+      # still a daily job nobody reads
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # The package is public, so the reads below would work unauthenticated.
       # Logging in anyway : this job would otherwise work only for as long as the
@@ -127,11 +485,16 @@ jobs:
           # Rebuilding "latest" from a tag whose build never published would put
           # an image behind a version number nobody can pull. The tags are walked
           # highest first and the first one that actually resolves in the
-          # registry is the release "latest" belongs to
+          # registry is the release "latest" belongs to.
+          # Filtered through the two shapes "Docker image CI" triggers on, so
+          # the walk weighs exactly the tags a release can have published and
+          # spends no registry read on a "v2.0-rc1" that none of this can reach
           IMAGE="ghcr.io/${{ steps.image-name.outputs.value }}"
           ERRORS="$RUNNER_TEMP/imagetools-error.txt"
+          CANDIDATES="$(git tag --list 'v[0-9]*.[0-9]*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$')" || true
           TAG=""
-          for CANDIDATE in $(git tag --list 'v[0-9]*.[0-9]*' --sort=-v:refname); do
+          for CANDIDATE in $CANDIDATES; do
             if docker buildx imagetools inspect "$IMAGE:$CANDIDATE" --format '{{json .Manifest}}' >/dev/null 2>"$ERRORS"; then
               TAG="$CANDIDATE"
               break
@@ -141,7 +504,9 @@ jobs:
             fi
             # Credentials, rate limit or outage are not an answer to "was this
             # version published ?", and guessing here would republish "latest"
-            # from the wrong source
+            # from the wrong source. This fails the job, and it no longer takes
+            # the Dell watch with it : that ran in the job above, and
+            # "report-dell-drift" reads it from there
             echo "::error::Could not read $IMAGE:$CANDIDATE, giving up rather than guessing which version is the current release"
             cat "$ERRORS"
             exit 1
@@ -154,9 +519,11 @@ jobs:
             # state of things is "nothing to refresh", every night, until the
             # first tag is cut. A workflow that is red every morning for a reason
             # nobody can act on is a workflow people stop reading, which is the
-            # exact failure this file exists to prevent. The Dell checks below
-            # still run : they need no published image to be useful, and the
-            # missing srvadmin tree is the thing that broke this repository
+            # exact failure this file exists to prevent. The Dell watch does not
+            # wait for any of this : it ran in the job above, off the working
+            # tree, and its "srvadmin tree has gone" is reported tonight rather
+            # than after the first release - which matters, because that missing
+            # tree is the thing that broke this repository
             echo "::notice::No v* tag resolves in $IMAGE, nothing has ever been published, so there is nothing to refresh"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -174,13 +541,14 @@ jobs:
 
           # Read from the release tag when there is one, because the image being
           # refreshed is built from that tag and its base is the one that
-          # matters ; from the working tree otherwise, so that the Dell checks
-          # below still have an EL major to ask about before the first release
-          # exists.
+          # matters ; from the working tree otherwise, so that the comparison
+          # below still has something to name before the first release exists.
           # Two Dockerfile shapes parse here and both are live : the one this
           # workflow is written for names its base on an ARG above the FROM line,
           # so that the digest resolved below can be passed in, and the one on
-          # master before that names it on the FROM line itself
+          # master before that names it on the FROM line itself. Which of the two
+          # it found is reported, because only the first can be rebuilt with the
+          # base pinned - see the comparison below
           if [ -n "$RELEASE_TAG" ]; then
             DOCKERFILE="$(git show "$RELEASE_TAG:Dockerfile")"
             SOURCE="$RELEASE_TAG"
@@ -189,30 +557,38 @@ jobs:
             SOURCE="the working tree"
           fi
 
-          BASE_IMAGE="$(printf '%s\n' "$DOCKERFILE" | awk '
+          PARSED="$(printf '%s\n' "$DOCKERFILE" | awk '
             toupper($1) == "ARG" {
               eq = index($2, "=")
               if (eq > 1) default_of[substr($2, 1, eq - 1)] = substr($2, eq + 1)
             }
             toupper($1) == "FROM" {
               ref = $2
+              name = ""
               if (ref ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) {
                 name = ref
                 gsub(/^\$\{?|\}$/, "", name)
                 ref = default_of[name]
               }
-              print ref
+              print ref "\t" name
               exit
             }')"
+          BASE_IMAGE="${PARSED%%$'\t'*}"
+          BASE_ARG="${PARSED#*$'\t'}"
           if [ -z "$BASE_IMAGE" ]; then
             echo "::error::Could not work out the base image from the Dockerfile of $SOURCE"
             exit 1
           fi
           echo "image=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "arg=$BASE_ARG" >> "$GITHUB_OUTPUT"
 
           # Same last-path-segment rule as everywhere else : a colon only
           # introduces a tag in the last segment, in "registry:5000/image" it is
-          # a host and a port
+          # a host and a port.
+          # Read here only to be held against the EL major the "dell" job asked
+          # about : that job reads the highest tag in git, this one the highest
+          # tag that resolves in the registry, and when the two disagree Dell's
+          # answer is about a tree this image is not built on
           REF="${BASE_IMAGE%%@*}"
           case "${REF##*/}" in
             *:*) BASE_TAG="${REF##*:}" ;;
@@ -222,11 +598,6 @@ jobs:
           if printf '%s' "$EL_MAJOR" | grep -qE '^[0-9]+$'; then
             echo "el-major=$EL_MAJOR" >> "$GITHUB_OUTPUT"
           else
-            # "almalinux:latest" lands here, which is what master carries until
-            # the base is pinned to an EL major. Nobody can say which of Dell's
-            # trees such an image is supposed to resolve against, so the Dell
-            # checks below have nothing to ask and say so rather than guess
-            echo "::warning::Could not work out which EL major '$BASE_IMAGE' is, so Dell's repository cannot be checked. Pin the base to an EL major"
             echo "el-major=" >> "$GITHUB_OUTPUT"
           fi
 
@@ -253,15 +624,23 @@ jobs:
           # Same ladder as "Docker image CI" uses on this exact call : the base
           # lives on Docker Hub, which answers 429 once the pull quota of the
           # window is spent. Without it the daily refresh is down precisely
-          # during the rate limit storms it exists to ride out
+          # during the rate limit storms it exists to ride out.
+          # And the same reading of the answer : "jq -r .digest" prints the four
+          # letters "null" and exits 0 when the key is absent, which used to be
+          # written out as digest=null and pinned as "almalinux@null" - a
+          # success, on a value no build could use
           for DELAY in 60 300 0; do
-            if DIGEST="$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}' | jq -r '.digest')"; then
-              echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-              # What the rebuild below is given, so the base that gets pushed and
-              # the digest recorded as a label are the same one - the whole point
-              # of a run that exists because the base moved
-              echo "pinned=$(pin_to_digest "$DIGEST")" >> "$GITHUB_OUTPUT"
-              exit 0
+            if MANIFEST="$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}')"; then
+              DIGEST="$(printf '%s' "$MANIFEST" | jq -r '.digest // empty')"
+              if printf '%s' "$DIGEST" | grep -qE '^[a-z0-9]+:[0-9a-f]{32,}$'; then
+                echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+                # What the rebuild below is given, so the base that gets pushed
+                # and the digest recorded as a label are the same one - the whole
+                # point of a run that exists because the base moved
+                echo "pinned=$(pin_to_digest "$DIGEST")" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::$BASE_IMAGE resolved to no usable digest (got '${DIGEST:-nothing}')"
             fi
             if [ "$DELAY" -gt 0 ]; then
               echo "::warning::Could not resolve $BASE_IMAGE, retrying in ${DELAY}s"
@@ -271,115 +650,27 @@ jobs:
           echo "::error::Could not resolve the digest of $BASE_IMAGE"
           exit 1
 
-      # What is watched in Dell's repository, and what is deliberately not.
-      #
-      # The srvadmin/ TREE for the EL major the Dockerfile pins, because its
-      # absence is the failure that went unnoticed for three and a half years.
-      # Dell publishes racadm and DSU for every OS it supports and srvadmin/ only
-      # where OMSA exists : os_dependent/RHEL10_64/ has metaRPMS/, racadm/ and
-      # repodata/ and no srvadmin/ at all, where RHEL8_64/ and RHEL9_64/ have
-      # both. An image whose base moved to an EL major without that tree gets a
-      # repository that resolves perfectly and has no srvadmin-all in it.
-      #
-      # The VERSION of srvadmin-all, because that is the package the Dockerfile
-      # installs and therefore the one number that describes this image's
-      # payload.
-      #
-      # Nothing else, and the omissions are the design. NOT the thirty component
-      # RPMs under srvadmin/ nor the nine other meta-RPMs beside srvadmin-all :
-      # they move on their own schedules - srvadmin-idrac sits on 11.4.0.0-1435
-      # today where everything else is on 11.1.0.0-5773 - so watching them would
-      # fire on changes that never reach this image. NOT the repodata, which is
-      # regenerated on syncs that changed no package. NOT the directory
-      # timestamps, which all carry the same value to the minute across every OS
-      # directory, because that is a mirror sync touching all of them rather than
-      # Dell publishing anything. A check that fires every week on something
-      # nobody has to act on is a check people learn to close unread, and then it
-      # is worth less than no check at all - the one that matters here fires
-      # about once a year.
-      - name: Read Dell's repository
-        id: dell
-        run: |
-          set -euo pipefail
-          EL_MAJOR="${{ steps.base.outputs.el-major }}"
-
-          if [ -z "$EL_MAJOR" ]; then
-            # Warned about in the step above, where the reason lives
-            echo "status=undetermined" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          OS_DIRECTORY_URL="$DELL_REPOSITORY_URL/RHEL${EL_MAJOR}_64"
-
-          fetch() {
-            curl --fail --silent --show-error --location \
-                 --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors "$1"
-          }
-
-          if ! INDEX="$(fetch "$OS_DIRECTORY_URL/")"; then
-            # "The server did not answer" is not "Dell removed it", and the two
-            # are never allowed to look alike here. An unreadable repository
-            # opens no issue and - see the comparison below - permits no rebuild
-            # either, because a rebuild resolves its packages from this same
-            # server and nobody can say what it would install. It costs one
-            # night, and the run says why
-            echo "::warning::Could not read $OS_DIRECTORY_URL/, so nothing can be said about Dell's repository today"
-            echo "status=unknown" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if ! printf '%s' "$INDEX" | grep -q 'href="srvadmin/"'; then
-            echo "::error::$OS_DIRECTORY_URL/ carries no srvadmin/ tree"
-            echo "status=missing" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if ! META_INDEX="$(fetch "$OS_DIRECTORY_URL/metaRPMS/")"; then
-            echo "::warning::Could not read $OS_DIRECTORY_URL/metaRPMS/, so nothing can be said about Dell's repository today"
-            echo "status=unknown" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Anchored on href= rather than on the link text : Apache truncates a
-          # long file name in the text it displays and leaves the href intact
-          VERSION="$(printf '%s' "$META_INDEX" \
-            | grep -oE 'href="srvadmin-all-[^"]+\.rpm"' \
-            | sed -E 's/^href="srvadmin-all-//; s/\.[A-Za-z0-9_]+\.rpm"$//' \
-            | sort -V | tail -n 1)" || true
-
-          if [ -z "$VERSION" ]; then
-            # The tree is there and srvadmin-all is not : Dell has restructured
-            # something. The same annotation level as the missing tree above,
-            # because it is the same fact - the image cannot be built - and the
-            # two must not look like different sizes of problem. Both leave the
-            # run green : the issue opened below is the channel, and a job that
-            # goes red every morning until somebody acts is a job people stop
-            # opening
-            echo "::error::Found no srvadmin-all package in $OS_DIRECTORY_URL/metaRPMS/"
-            echo "status=missing" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Dell publishes srvadmin-all $VERSION for EL$EL_MAJOR"
-          # Whether that is a change is decided in the comparison below, which is
-          # where the published image is read
-          echo "status=present" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Compare both with the published image
         id: compare
+        # Everything read out of Dell's directory listing arrives through env:
+        # rather than through ${{ }}. A ${{ }} is pasted into the script before
+        # a shell ever sees it, so a version parsed off an href - and the parser
+        # admits every character Apache does not escape, $ ( ) among them - would
+        # be text the shell evaluates, in the job holding the registry
+        # credentials. The report-dell-drift job below already does it this way ;
+        # this is the same fix, in the other place that reads those outputs
+        env:
+          DELL_STATUS: ${{ needs.dell.outputs.status }}
+          DELL_VERSION: ${{ needs.dell.outputs.version }}
+          DELL_EL_MAJOR: ${{ needs.dell.outputs.el-major }}
+          DELL_SOURCE: ${{ needs.dell.outputs.source }}
         run: |
           set -euo pipefail
           RELEASE_TAG="${{ steps.release.outputs.tag }}"
-          DELL_STATUS="${{ steps.dell.outputs.status }}"
-          DELL_VERSION="${{ steps.dell.outputs.version }}"
+          RELEASE_EL_MAJOR="${{ steps.base.outputs.el-major }}"
+          BASE_ARG="${{ steps.base.outputs.arg }}"
 
-          # Every path out of this step goes through here, once, with all three
+          # Every path out of this step goes through here, once, with all five
           # outputs. Written this way rather than as a default set refined later
           # because a step that writes the same output name twice is relying on
           # which of the two the runner keeps, and nothing in this file needs to
@@ -388,18 +679,25 @@ jobs:
             {
               printf 'rebuild=%s\n' "$1"
               printf 'status=%s\n' "$2"
-              printf 'published-omsa-version=%s\n' "$3"
+              printf 'baseline-omsa-version=%s\n' "$3"
+              printf 'baseline-source=%s\n' "$4"
+              printf 'latest-digest=%s\n' "$5"
             } >> "$GITHUB_OUTPUT"
           }
 
           if [ -z "$RELEASE_TAG" ]; then
             # "present" means "Dell serves this today" and nothing more. With no
-            # published image to compare it against it can never become
-            # "unchanged" or "moved", so it is named for what it is
+            # published image anywhere there is nothing it could be compared
+            # against, tonight or any night before the first release, so it is
+            # named for that rather than for the missing baseline : "no-release"
+            # is a state nobody has to act on, where "no-baseline" below is one
+            # somebody does. Dell's other answers pass through untouched - a
+            # missing srvadmin tree is worth reporting on a repository that has
+            # never released, since that is the state this one was in
             if [ "$DELL_STATUS" = "present" ]; then
-              DELL_STATUS="no-baseline"
+              DELL_STATUS="no-release"
             fi
-            emit false "$DELL_STATUS" ""
+            emit false "$DELL_STATUS" "" "" ""
             {
               echo "Nothing has been published under a version tag yet, so there is no image to refresh."
               echo
@@ -408,37 +706,57 @@ jobs:
             exit 0
           fi
 
-          IMAGE="ghcr.io/${{ steps.image-name.outputs.value }}:latest"
+          IMAGE="ghcr.io/${{ steps.image-name.outputs.value }}"
           ERRORS="$RUNNER_TEMP/imagetools-error.txt"
 
           # Read from GHCR rather than Docker Hub : anonymous Docker Hub requests
           # are rate limited per IP and the runners share theirs. The labels the
           # publishing workflow stamps are the only state these workflows keep -
           # there is no database anywhere, the registry is the record
-          if CONFIG="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Image}}' 2>"$ERRORS")"; then
-            label_of() {
-              printf '%s' "$CONFIG" \
-                | jq -r --arg LABEL "$1" \
-                    'if has("config") then [.] else [.[]] end
-                     | map(.config.Labels[$LABEL] // empty)
-                     | first // ""'
-            }
-            PUBLISHED_BASE_DIGEST="$(label_of org.opencontainers.image.base.digest)"
-            PUBLISHED_VERSION="$(label_of org.opencontainers.image.version)"
-            PUBLISHED_OMSA_VERSION="$(label_of io.github.tigerblue77.dell-omsa.srvadmin-all.version)"
+          config_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>"$ERRORS"
+          }
+          label_of() {
+            printf '%s' "$1" \
+              | jq -r --arg LABEL "$2" \
+                  'if has("config") then [.] else [.[]] end
+                   | map(.config.Labels[$LABEL] // empty)
+                   | first // ""'
+          }
+
+          if CONFIG="$(config_of "$IMAGE:latest")"; then
+            PUBLISHED_BASE_DIGEST="$(label_of "$CONFIG" org.opencontainers.image.base.digest)"
+            PUBLISHED_VERSION="$(label_of "$CONFIG" org.opencontainers.image.version)"
+            PUBLISHED_OMSA_VERSION="$(label_of "$CONFIG" io.github.tigerblue77.dell-omsa.srvadmin-all.version)"
+            # A second read, for the manifest digest of the exact "latest" this
+            # decision is being taken about. It is what the rebuild job holds the
+            # registry against immediately before pushing : any republication by
+            # anything, including a "docker push" typed by hand, changes it
+            # Answered three ways like every other registry read in this file,
+            # rather than two : as written it was the only one that could fail
+            # the job on a transient hiccup with nothing but the bare error
+            # docker prints, no annotation, and the Dell drift report going down
+            # with it one line after the same registry answered successfully
+            if ! MANIFEST="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' 2>"$ERRORS")"; then
+              echo "::error::Could not read the manifest of $IMAGE:latest, giving up rather than assuming something moved"
+              cat "$ERRORS"
+              exit 1
+            fi
+            LATEST_DIGEST="$(printf '%s' "$MANIFEST" | jq -r '.digest // empty')"
           elif grep -qiE 'not found|manifest unknown|name unknown' "$ERRORS"; then
             # Nothing published under that tag, so there is nothing to compare
             # against and everything to build
             PUBLISHED_BASE_DIGEST=""
             PUBLISHED_VERSION=""
             PUBLISHED_OMSA_VERSION=""
+            LATEST_DIGEST=""
           else
             # Credentials, rate limit, registry outage : none of these are an
             # answer to "did anything move ?". Treating an unreadable image as
             # "changed" is what would turn this workflow into an unconditional
             # daily republication of "latest", green run after green run, with
             # nobody noticing
-            echo "::error::Could not read $IMAGE, giving up rather than assuming something moved"
+            echo "::error::Could not read $IMAGE:latest, giving up rather than assuming something moved"
             cat "$ERRORS"
             exit 1
           fi
@@ -454,19 +772,56 @@ jobs:
             exit 1
           fi
 
+          # Which srvadmin-all the image being refreshed was built with, and the
+          # answer is a property of the RELEASE image rather than of "latest" -
+          # the label on "latest" is a copy of it, and a copy can be missing.
+          # It is missing in the state this repository is in right now : the
+          # image sitting on both registries since 2023 carries
+          # org.opencontainers.image.version "latest", no base digest and no OMSA
+          # version, because nothing stamped those before this pipeline existed.
+          # Asking the release tag's own image second is what turns the common
+          # case of that - a release published, "latest" left behind by a
+          # half-failed push - back into a comparison that works
+          BASELINE_OMSA_VERSION="$PUBLISHED_OMSA_VERSION"
+          BASELINE_SOURCE="the published latest"
+          if [ -z "$BASELINE_OMSA_VERSION" ]; then
+            if RELEASE_CONFIG="$(config_of "$IMAGE:$RELEASE_TAG")"; then
+              BASELINE_OMSA_VERSION="$(label_of "$RELEASE_CONFIG" io.github.tigerblue77.dell-omsa.srvadmin-all.version)"
+              BASELINE_SOURCE="the image published for $RELEASE_TAG"
+            fi
+          fi
+          if [ -z "$BASELINE_OMSA_VERSION" ]; then
+            BASELINE_SOURCE=""
+          fi
+
           # Has Dell moved ? Only answerable when both sides of the comparison
-          # exist. A "latest" carrying no OMSA version label is one this workflow
-          # pair did not publish - the image that has been sitting on both
-          # registries since 2023 is exactly that - and there is then nothing to
-          # protect : republishing it from the release tag is the repair, and
-          # whatever Dell serves today is what that release would have installed
-          # anyway
+          # exist, and only when they are about the same tree
           DELL_MOVED=false
-          if [ "$DELL_STATUS" = "present" ]; then
-            if [ -z "$PUBLISHED_OMSA_VERSION" ]; then
-              echo "::warning::The published latest records no srvadmin-all version, so Dell's packages cannot be compared against it"
+          if [ -n "$RELEASE_EL_MAJOR" ] && [ "$RELEASE_EL_MAJOR" != "$DELL_EL_MAJOR" ]; then
+            # The "dell" job reads its EL major off the highest tag in git,
+            # this job off the highest tag that resolves in the registry. They
+            # differ when a tag was pushed whose build never published, and the
+            # Dell answer is then about a tree this image is not built on
+            echo "::warning::Dell was asked about EL${DELL_EL_MAJOR:-nothing}, read off $DELL_SOURCE, where $RELEASE_TAG builds on EL$RELEASE_EL_MAJOR. The answer is about another tree and is not used"
+            DELL_STATUS="undetermined"
+          elif [ "$DELL_STATUS" = "present" ]; then
+            if [ -z "$BASELINE_OMSA_VERSION" ]; then
+              # Nothing anywhere records which OMSA the published image carries.
+              # This used to be waved through - "there is nothing to protect" -
+              # and what it waved through is the one thing the whole lower half
+              # of this file exists to prevent : the rebuild resolves
+              # "dnf install srvadmin-all" from Dell live, so it would publish
+              # whatever Dell serves today into "latest", under the old version
+              # number, with no issue opened and nobody having decided it. An
+              # unguarded OMSA upgrade is exactly what a moved Dell is blocked
+              # for, and "we cannot tell whether Dell moved" is not a weaker
+              # state than "Dell moved" - it is the same state with less
+              # information. So it blocks too, and it is reported, because a
+              # rebuild held back by something nobody is told about is a "latest"
+              # that quietly stops being refreshed
+              echo "::warning::Neither the published latest nor the image published for $RELEASE_TAG records which srvadmin-all it was built with, so Dell's packages cannot be compared against anything"
               DELL_STATUS="no-baseline"
-            elif [ "$DELL_VERSION" != "$PUBLISHED_OMSA_VERSION" ]; then
+            elif [ "$DELL_VERSION" != "$BASELINE_OMSA_VERSION" ]; then
               DELL_STATUS="moved"
               DELL_MOVED=true
             else
@@ -504,22 +859,47 @@ jobs:
           # days. The real fix is to pin srvadmin-all's version in the Dockerfile
           # so a rebuild is reproducible, which would let the two watches be
           # independent again - it needs a second ARG in a file this pull request
-          # does not own, and it is worth doing
+          # does not own, and it is worth doing.
+          #
+          # Every state that is not "Dell has not moved" blocks. "unchanged" is
+          # the only one that lets a rebuild through, and it is spelled as the
+          # only arm that does nothing rather than as a default, so a state added
+          # here later has to say for itself which side it is on
           BLOCKED_BY=""
           case "$DELL_STATUS" in
-            unchanged|no-baseline) ;;
+            unchanged)    ;;
             moved)        BLOCKED_BY="Dell published srvadmin-all $DELL_VERSION" ;;
-            missing)      BLOCKED_BY="Dell publishes no srvadmin tree for EL${{ steps.base.outputs.el-major }}" ;;
+            missing)      BLOCKED_BY="Dell publishes no srvadmin tree for EL${DELL_EL_MAJOR:-nothing}" ;;
             unknown)      BLOCKED_BY="Dell's repository could not be read" ;;
-            undetermined) BLOCKED_BY="the EL major of the base image could not be worked out" ;;
+            undetermined) BLOCKED_BY="the EL major this image is built on could not be matched against the tree Dell was asked about" ;;
+            no-baseline)  BLOCKED_BY="nothing records which srvadmin-all the published image was built with" ;;
             *)            BLOCKED_BY="Dell's repository is in an unexpected state ($DELL_STATUS)" ;;
           esac
+
+          # A second blocker, about this repository rather than about Dell, and
+          # only named when Dell is not already the reason. A Dockerfile that
+          # writes its base on the FROM line accepts "--build-arg BASE_IMAGE" and
+          # ignores it : the rebuild below would resolve the base a second time,
+          # at build time, and stamp the digest read here onto bytes that may
+          # have been built on another one. The refresh exists to record which
+          # base "latest" is on, so publishing one that cannot be pinned defeats
+          # the run rather than completing it
+          if [ -z "$BLOCKED_BY" ] && [ -z "$BASE_ARG" ]; then
+            BLOCKED_BY="the Dockerfile of $RELEASE_TAG names its base on its FROM line, so a rebuild could not pin it"
+          elif [ -z "$BLOCKED_BY" ] && [ "$BASE_ARG" != "BASE_IMAGE" ]; then
+            # The rename half of the same defect, refused outright by the release
+            # workflow and only blocking here : a tag already published with a
+            # differently-named ARG is a fact this workflow has to live with, and
+            # the honest thing to do with it is decline to republish "latest"
+            # from it and say which name is in the way
+            BLOCKED_BY="the Dockerfile of $RELEASE_TAG takes its base from 'ARG $BASE_ARG' rather than 'ARG BASE_IMAGE', so the '--build-arg BASE_IMAGE' a rebuild passes would be accepted, ignored, and the base resolved a second time"
+          fi
 
           REBUILD=false
           if [ -n "$REFRESH_REASON" ] && [ -z "$BLOCKED_BY" ]; then
             REBUILD=true
           fi
-          emit "$REBUILD" "$DELL_STATUS" "$PUBLISHED_OMSA_VERSION"
+          emit "$REBUILD" "$DELL_STATUS" "$BASELINE_OMSA_VERSION" "$BASELINE_SOURCE" "$LATEST_DIGEST"
 
           {
             echo "| | |"
@@ -528,7 +908,8 @@ jobs:
             echo "| Base image | \`${{ steps.base.outputs.image }}\` |"
             echo "| Published image was built on | \`${PUBLISHED_BASE_DIGEST:-none recorded}\` |"
             echo "| Base image now points to | \`${{ steps.base.outputs.digest }}\` |"
-            echo "| Published image was built with | \`srvadmin-all ${PUBLISHED_OMSA_VERSION:-none recorded}\` |"
+            echo "| Published image was built with | \`srvadmin-all ${BASELINE_OMSA_VERSION:-none recorded}\` |"
+            echo "| Read from | ${BASELINE_SOURCE:-nowhere} |"
             echo "| Dell now publishes | \`srvadmin-all ${DELL_VERSION:-unknown}\` |"
             echo
             if [ "$REBUILD" = true ]; then
@@ -546,7 +927,7 @@ jobs:
 
   rebuild:
     name: Rebuild and republish "latest" from the last release
-    needs: check
+    needs: [dell, check]
     if: ${{ needs.check.outputs.rebuild == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -614,7 +995,7 @@ jobs:
             org.opencontainers.image.base.digest=${{ needs.check.outputs.base-digest }}
             org.opencontainers.image.version=${{ needs.check.outputs.release-tag }}
             org.opencontainers.image.revision=${{ needs.check.outputs.release-sha }}
-            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ needs.check.outputs.dell-version }}
+            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ needs.dell.outputs.version }}
           # Stated again because the action's getAnnotations() reads this input
           # and never the one above, so a custom label declared there alone never
           # becomes an annotation. See the same block in "Docker image CI"
@@ -624,16 +1005,73 @@ jobs:
             org.opencontainers.image.base.digest=${{ needs.check.outputs.base-digest }}
             org.opencontainers.image.version=${{ needs.check.outputs.release-tag }}
             org.opencontainers.image.revision=${{ needs.check.outputs.release-sha }}
-            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ needs.check.outputs.dell-version }}
+            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ needs.dell.outputs.version }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      # The last thing read before anything is pushed, and it is read again
+      # rather than trusted from the check job. Sharing a concurrency group with
+      # "Docker image CI" already stops a release from publishing while this run
+      # is in flight, and this step is what covers everything a group cannot
+      # reach : a "docker push" typed by hand, a run cancelled and resumed, a
+      # third workflow added later by somebody who does not read this file.
+      #
+      # The manifest digest and not the version label, because it moves whatever
+      # the reason. If "latest" is not byte for byte the one the comparison was
+      # made about, that comparison is about an image that no longer exists and
+      # the only safe thing to publish is nothing. Skipping costs one night ;
+      # pushing costs users a "latest" built from older source than the one they
+      # already have, which is the one thing no workflow here may ever do.
+      #
+      # Read from GHCR alone, like every other registry read in this file, which
+      # leaves one hole worth naming : a "latest" pushed to Docker Hub only is
+      # invisible here and would be overwritten. Both of these workflows push the
+      # two registries together, so only a hand push can produce that, and it is
+      # the same blind spot the release workflow's own "latest" gate states -
+      # reading Docker Hub costs a quota this job has better uses for
+      - name: Check that "latest" has not moved since the comparison
+        id: still_current
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ needs.check.outputs.image-name }}"
+          EXPECTED="${{ needs.check.outputs.latest-digest }}"
+          ERRORS="$RUNNER_TEMP/imagetools-error.txt"
+
+          CURRENT=""
+          if MANIFEST="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' 2>"$ERRORS")"; then
+            CURRENT="$(printf '%s' "$MANIFEST" | jq -r '.digest // empty')"
+          elif grep -qiE 'not found|manifest unknown|name unknown' "$ERRORS"; then
+            # Nothing under that tag, which is also what the check job saw if it
+            # read the same thing. An empty digest on both sides agrees
+            CURRENT=""
+          else
+            cat "$ERRORS"
+            echo "::warning::Could not re-read $IMAGE:latest, so it cannot be told whether it moved. Nothing is pushed tonight"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$CURRENT" = "$EXPECTED" ]; then
+            echo "latest is still ${CURRENT:-absent}, the same image the comparison was made about"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::latest is now ${CURRENT:-absent} where the comparison read ${EXPECTED:-absent}, so something published it while this run was in flight. Nothing is pushed : a release that has just gone out must not be overwritten by a rebuild of older source"
+          echo "push=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "\`latest\` moved while this run was in flight, from \`${EXPECTED:-absent}\` to \`${CURRENT:-absent}\`, so it was left alone."
+            echo
+            echo "Tomorrow's run reads the new state and refreshes it if it still needs it."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # One platform, and no QEMU above this step. The reasoning is written out
       # in full beside the same decision in "Docker image CI" : OMSA is x86_64
       # software, every one of the forty packages making up srvadmin-all is
       # x86_64, and an arm64 image would be an arm64 AlmaLinux with no OMSA in it
       - name: Build and publish the image
+        if: ${{ steps.still_current.outputs.push == 'true' }}
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -646,7 +1084,10 @@ jobs:
           # The exact digest the check job compared against, and not "almalinux:9"
           # re-resolved here. A base that moves between the two steps used to
           # leave the label one behind the bytes ; pinned, the label records what
-          # was built, and a base that moves mid-run is simply picked up tomorrow
+          # was built, and a base that moves mid-run is simply picked up tomorrow.
+          # The check job refuses to permit a rebuild at all when the release
+          # tag's Dockerfile has no ARG for this to reach, because there it would
+          # be accepted, ignored, and the label would describe another base
           build-args: |
             BASE_IMAGE=${{ needs.check.outputs.base-pinned }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -693,17 +1134,45 @@ jobs:
   # the maintainer. The issue is opened the morning it appears, it says what to
   # do, and cutting a tag takes a minute - and users who cannot wait can build
   # the Dockerfile themselves, which resolves Dell's repository live.
+  #
+  # The condition below is written the long way for one reason : this job has to
+  # survive the check job failing, and it must never report a state it cannot
+  # stand behind. "always()" is what lets it run at all when "check" is red, and
+  # each arm says which job the answer comes from.
+  #
+  #   The three states decided by the comparison - moved, no-baseline, and a
+  #   missing tree it has confirmed - are read from "check". They need both
+  #   sides, so if that job did not finish they are not known, and a guess in
+  #   either direction is worse than tomorrow's run.
+  #
+  #   "missing" is the one answer the Dell job establishes on its own : it takes
+  #   no registry and no published image to see that Dell's srvadmin tree is
+  #   gone. It is read from "dell" only when "check" produced no answer at all,
+  #   which keeps a deleted version tag, a GHCR permission blip or a Docker Hub
+  #   rate limit from silencing the one watch that has ever caught anything
+  #   here - and keeps the comparison's verdict authoritative whenever there is
+  #   one, because the two jobs can legitimately be looking at different EL
+  #   majors
   report-dell-drift:
     name: Open an issue about Dell's repository
-    needs: check
-    if: ${{ needs.check.outputs.dell-status == 'moved' || needs.check.outputs.dell-status == 'missing' }}
+    needs: [dell, check]
+    # Folded onto one line by YAML : every continuation is indented exactly as
+    # the first, so the block scalar joins them with spaces rather than keeping
+    # newlines inside the expression
+    if: >-
+      ${{ always() && (
+      needs.check.outputs.dell-status == 'moved'
+      || needs.check.outputs.dell-status == 'missing'
+      || needs.check.outputs.dell-status == 'no-baseline'
+      || (needs.dell.outputs.status == 'missing' && needs.check.outputs.dell-status == '')
+      ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
       issues: write
     steps:
-      - name: Open an issue, unless the same one is already open
+      - name: Open an issue, unless the same one has already been filed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # gh works out which repository to act on from the git remote of the
@@ -713,10 +1182,21 @@ jobs:
           # repository point to a known GitHub host", which is a confusing way to
           # learn that an issue was not opened
           GH_REPO: ${{ github.repository }}
-          DELL_STATUS: ${{ needs.check.outputs.dell-status }}
-          DELL_VERSION: ${{ needs.check.outputs.dell-version }}
-          PUBLISHED_OMSA_VERSION: ${{ needs.check.outputs.published-omsa-version }}
-          EL_MAJOR: ${{ needs.check.outputs.el-major }}
+          # The comparison's verdict when there is one, the Dell job's own answer
+          # when the check job never got that far. "||" in an expression yields
+          # the first value that is not empty, and the condition above has
+          # already established that whichever arrives here is one this job may
+          # act on
+          DELL_STATUS: ${{ needs.check.outputs.dell-status || needs.dell.outputs.status }}
+          # These two come from the Dell job either way : it is the one that read
+          # them, and it is the one that is still standing when the check job is
+          # not
+          DELL_VERSION: ${{ needs.dell.outputs.version }}
+          EL_MAJOR: ${{ needs.dell.outputs.el-major }}
+          # Empty when the check job failed, which every use of them below allows
+          # for
+          BASELINE_OMSA_VERSION: ${{ needs.check.outputs.baseline-omsa-version }}
+          BASELINE_SOURCE: ${{ needs.check.outputs.baseline-source }}
           RELEASE_TAG: ${{ needs.check.outputs.release-tag }}
         run: |
           set -euo pipefail
@@ -735,11 +1215,23 @@ jobs:
               printf '%s\n\n' 'This is the failure that left this image unbuildable for three and a half years without a single red build (#9) : Dell publishes `racadm` and DSU for every operating system it supports, and `srvadmin/` only where OMSA exists, so the repository still resolves perfectly and `dnf install srvadmin-all` simply has nothing to install.'
               printf '%s\n\n' 'The next build of this image will fail. What it needs is a decision : repin the Dockerfile'"'"'s `ARG BASE_IMAGE` to an EL major Dell still publishes OMSA for, or accept that the image has reached the end of what Dell supports. OMSA shipped its final release on 2024-09-30 and is in sustenance until 2027-09-30, so there is no newer major coming.'
               printf '%s\n\n' 'Refreshes of `latest` for base image fixes are held back until this is resolved, because the rebuild they perform would fail on exactly this.'
+              printf '%s\n\n' 'The index was read and parsed before this was concluded : a directory that carries `racadm/` or `repodata/` and no `srvadmin/` is Dell having removed it, where an index that carries none of the three is one this workflow cannot read, which is reported as unknown and opens nothing.'
+            } > "$BODY"
+          elif [ "$DELL_STATUS" = "no-baseline" ]; then
+            # Blocked, and blocked silently until this existed. The rebuild is
+            # held back because nothing records what the published image was
+            # built with, and that is a state only a release can leave
+            TITLE="Nothing records which srvadmin-all the published image was built with"
+            {
+              printf '%s\n\n' "The published \`latest\` carries no \`io.github.tigerblue77.dell-omsa.srvadmin-all.version\` label, and neither does the image published for \`${RELEASE_TAG:-the last release}\`, so there is nothing to compare $OS_DIRECTORY_URL/metaRPMS/ against."
+              printf '%s\n\n' 'That label is stamped by this repository'"'"'s publishing pipeline, so an image without it predates the pipeline : the image that has been sitting on both registries since 2023-03-04 is exactly that, and so is anything pushed by hand.'
+              printf '%s\n\n' 'Refreshes of `latest` are held back while this is the case, and that is deliberate rather than a gap. A rebuild resolves `srvadmin-all` from Dell live, so with no record of what is in the published image there is no way to tell a base image refresh from an unguarded OMSA upgrade pushed onto every `docker pull` under the old version number. "We cannot tell whether Dell moved" is the same state as "Dell moved" with less information, and it is treated the same way.'
+              printf '%s\n\n' 'What to do : cut a version tag. The release build publishes the image, stamps the label, and every following night has a baseline to compare against.'
             } > "$BODY"
           else
             TITLE="Dell published srvadmin-all $DELL_VERSION for EL$EL_MAJOR"
             {
-              printf '%s\n\n' "Dell now publishes \`srvadmin-all $DELL_VERSION\` for EL$EL_MAJOR, where the published \`latest\` was built with \`srvadmin-all ${PUBLISHED_OMSA_VERSION:-an unrecorded version}\` - read from $OS_DIRECTORY_URL/metaRPMS/ and from the label on the published image."
+              printf '%s\n\n' "Dell now publishes \`srvadmin-all $DELL_VERSION\` for EL$EL_MAJOR, where the published image was built with \`srvadmin-all ${BASELINE_OMSA_VERSION:-an unrecorded version}\` - read from $OS_DIRECTORY_URL/metaRPMS/ and from the label on ${BASELINE_SOURCE:-the published image}."
               printf '%s\n\n' 'Nothing has been rebuilt or republished, and that is deliberate. A new OMSA is a change to what this image IS, not a fix to what is already in it : nothing in this repository can test it, since OMSA needs a real PowerEdge ; `configure_and_run_Dell_OMSA.sh` depends on OMSA'"'"'s own paths and service names and may need changing with it ; and a `latest` that quietly moves from one OMSA to another under the same version number is an image nobody can pin, roll back or describe, which is the state this repository'"'"'s publishing pipeline was rewritten to end.'
               printf '%s\n\n' "What to do : read Dell's release note for the new version, check \`configure_and_run_Dell_OMSA.sh\` and the \`Dockerfile\` against it, and cut a version tag. The release build publishes the image and moves \`latest\` onto it. The last published release is \`${RELEASE_TAG:-none}\`."
               printf '%s\n\n' 'Until then, refreshes of `latest` for base image fixes are held back, because a rebuild resolves `srvadmin-all` from Dell live and would fold this new version into `latest` as a side effect - silently, under the same version number, with nobody having decided it.'
@@ -748,14 +1240,36 @@ jobs:
 
           # Deduplicated on the exact title rather than on a label, so that no
           # label has to exist for this to work and so that Dell moving AGAIN
-          # opens a second issue - which is right, it is a different fact. The
-          # list is read rather than searched : GitHub's search index lags by
-          # minutes and a lagging index here means a duplicate issue every
-          # morning until it catches up
-          NUMBER="$(gh issue list --state open --limit 100 --json number,title \
-            | jq -r --arg TITLE "$TITLE" '(map(select(.title == $TITLE)) | .[0].number) // empty')"
-          if [ -n "$NUMBER" ]; then
-            echo "::notice::Already open as #$NUMBER, nothing to do"
+          # opens a second issue - which is right, it is a different fact.
+          #
+          # Against CLOSED issues as well as open ones, which is the half that
+          # was missing. The drift this reports does not go away until somebody
+          # cuts a tag, so a maintainer who reads the issue and closes it as "not
+          # now" - a perfectly reasonable thing to do with a once-a-year OMSA
+          # release - was handed an identical issue the next morning, and the one
+          # after, indefinitely. Closing it is an answer, and this takes it as
+          # one : a closed issue with this exact title means the fact has been
+          # seen. Dell moving again changes the version in the title and files a
+          # new one, which is the only event that should.
+          #
+          # Read through "gh api --paginate" rather than "gh issue list --limit
+          # 100" : the list comes back newest first, so a long-open issue drops
+          # out of the window as soon as a hundred issues are filed after it, and
+          # the duplicate it was meant to prevent starts arriving again. Walking
+          # every page has no window at all. Still a listing and not a search,
+          # because GitHub's search index lags by minutes and a lagging index
+          # here means a duplicate every morning until it catches up.
+          #
+          # The issues endpoint returns pull requests too - they are issues to
+          # that API - so anything carrying a "pull_request" key is dropped : a
+          # pull request whose title happened to match would otherwise silence
+          # the report
+          EXISTING="$(gh api --paginate --method GET "repos/$GITHUB_REPOSITORY/issues" \
+            -f state=all -f per_page=100 \
+            --jq '.[] | select(has("pull_request") | not) | [(.number | tostring), .state, .title] | @tsv' \
+            | awk -F'\t' -v title="$TITLE" '$3 == title { print $1 " (" $2 ")"; exit }')"
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::Already filed as #$EXISTING, nothing to do"
             exit 0
           fi
 
