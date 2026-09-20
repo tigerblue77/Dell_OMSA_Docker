@@ -68,11 +68,18 @@ function shebang_interpreter_of() {
 
 # Every file of this repository that is a shell script, whatever directory it
 # sits in. Globbed rather than listed, so a script added later is covered by
-# these cases instead of quietly falling outside them
+# these cases instead of quietly falling outside them.
+#
+# tools/ is in the walk although it is empty on this branch : an operator tool
+# arrives there on claude/privilege-probe, and a directory added to the tree
+# after the walk was written is exactly how a script ends up checked by nothing.
+# nullglob makes an absent directory cost nothing, so the entry is free until
+# the day it is not
 function every_shell_script_of_the_tree() {
   shopt -s globstar nullglob
   local SCRIPT
   for SCRIPT in "$REPO_ROOT"/*.sh "$REPO_ROOT"/.github/**/*.sh "$REPO_ROOT"/.claude/**/*.sh \
+    "$REPO_ROOT"/tools/*.sh \
     "$TESTS_DIRECTORY"/*.sh "$TESTS_DIRECTORY"/lib/*.sh "$TESTS_DIRECTORY"/cases/*.sh \
     "$TESTS_DIRECTORY"/mocks/*; do
     [ -f "$SCRIPT" ] && printf '%s\n' "$SCRIPT"
@@ -183,6 +190,7 @@ function test_every_file_of_the_repository_carries_the_licence_header() {
   shopt -s nullglob
   local FILE
   for FILE in "$REPO_ROOT"/*.sh "$REPO_ROOT"/Dockerfile \
+    "$REPO_ROOT"/tools/*.sh \
     "$REPO_ROOT"/.github/*.yml "$REPO_ROOT"/.github/*.yaml \
     "$REPO_ROOT"/.github/workflows/*.yml "$REPO_ROOT"/.github/workflows/*.yaml; do
     [ -f "$FILE" ] || continue
