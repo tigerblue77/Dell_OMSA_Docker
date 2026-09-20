@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "getent" used by the test suite.
+#
+# The entrypoint does not call it today : it decides whether a user exists by
+# grepping /etc/passwd, which answers for that one file rather than for the
+# system's user database, and does it with a case-insensitive regular expression
+# built out of the username (see the cases in tests/cases/30_user_provisioning.sh).
+# "getent passwd -- <name>" is what answers the question properly, so this mock
+# is here for the pull request that moves to it.
+#
+# It answers out of $MOCK_GETENT_PASSWD_FILE, which the harness points at the
+# sandbox's own passwd file, and it answers the way the real tool does : the
+# matching line on stdout and status 0, or nothing and status 2 when the key is
+# not found.
+#
+# Recognized environment variables:
+#   MOCK_GETENT_CALL_LOG         file the invocations are appended to
+#   MOCK_GETENT_PASSWD_FILE      the passwd database it answers out of
+#   MOCK_GETENT_OUTPUT           an answer given instead of the lookup, for a
+#                                test that wants a user the sandbox file has not
+#                                got (an LDAP or SSSD account, which is exactly
+#                                what /etc/passwd cannot see)
+#   MOCK_GETENT_EXIT_CODE        exit code, overriding the lookup's own
+#   MOCK_GETENT_SECOND_EXIT_CODE exit code returned from the
+#                                MOCK_GETENT_SWITCH_AFTER_CALLS+1-th call
+#                                onwards, which is how a "look, create, look
+#                                again" sequence is made to see the account
+#                                appear
+#   MOCK_GETENT_SWITCH_AFTER_CALLS  when to switch (default 1)
+
+if [ -n "${MOCK_GETENT_CALL_LOG:-}" ]; then
+  printf '%s\n' "getent${*:+ $*}" >> "$MOCK_GETENT_CALL_LOG"
+fi
+
+# "getent passwd -- omsauser" : the database, then the keys, with the "--" that
+# keeps a key beginning with a dash from being read as an option
+DATABASE=""
+declare -a KEYS=()
+for ARGUMENT in "$@"; do
+  case "$ARGUMENT" in
+    --) continue ;;
+    -*) [ -n "$DATABASE" ] && KEYS+=("$ARGUMENT"); continue ;;
+    *)
+      if [ -z "$DATABASE" ]; then
+        DATABASE="$ARGUMENT"
+      else
+        KEYS+=("$ARGUMENT")
+      fi
+      ;;
+  esac
+done
+
+if [ -n "${MOCK_GETENT_OUTPUT:-}" ]; then
+  printf '%s\n' "$MOCK_GETENT_OUTPUT"
+  exit "${MOCK_GETENT_EXIT_CODE:-0}"
+fi
+
+EXIT_CODE="${MOCK_GETENT_EXIT_CODE:-}"
+if [ -n "${MOCK_GETENT_SECOND_EXIT_CODE:-}" ] && [ -n "${MOCK_GETENT_CALL_LOG:-}" ]; then
+  # The current call is already in the log, so this counts it too
+  CALL_NUMBER=$(wc -l < "$MOCK_GETENT_CALL_LOG")
+  if [ "$CALL_NUMBER" -gt "${MOCK_GETENT_SWITCH_AFTER_CALLS:-1}" ]; then
+    EXIT_CODE="$MOCK_GETENT_SECOND_EXIT_CODE"
+  fi
+fi
+
+if [ -n "$EXIT_CODE" ] && [ "$EXIT_CODE" -ne 0 ]; then
+  exit "$EXIT_CODE"
+fi
+
+if [ "$DATABASE" != "passwd" ] || [ ! -f "${MOCK_GETENT_PASSWD_FILE:-}" ]; then
+  # Only the passwd database is simulated : an unknown one is "Unsupported
+  # database", which the real tool reports with status 1
+  exit 1
+fi
+
+# Exact, case-sensitive match on the login name, which is the whole point of
+# asking getent rather than grepping the file
+FOUND=false
+for KEY in "${KEYS[@]}"; do
+  while IFS= read -r LINE; do
+    [ "${LINE%%:*}" == "$KEY" ] || continue
+    printf '%s\n' "$LINE"
+    FOUND=true
+  done < "$MOCK_GETENT_PASSWD_FILE"
+done
+
+if [ "${#KEYS[@]}" -eq 0 ]; then
+  cat "$MOCK_GETENT_PASSWD_FILE"
+  exit "${EXIT_CODE:-0}"
+fi
+
+$FOUND || exit 2
+exit "${EXIT_CODE:-0}"

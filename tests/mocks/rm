@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "rm" used by the test suite.
+#
+# Same shape and same reasoning as mocks/chmod : it records the invocation and
+# then hands it to the system's own rm, so that a test can assert both what the
+# entrypoint asked to remove and that the file is actually gone. Every path it
+# is given has been rewritten into $TEST_ROOT before the entrypoint runs, so the
+# real rm applied here only ever reaches a file this run created -- and a path
+# that had NOT been rewritten would have been caught by
+# absolute_paths_escaping_the_sandbox() before anything ran.
+#
+# A refusal to do anything at all would not be safer, and would be considerably
+# more dangerous in one specific way : the mocks are first in the PATH for the
+# whole test case, so an inert rm would quietly break every cleanup the suite
+# does through it.
+#
+# Recognized environment variables:
+#   MOCK_RM_CALL_LOG             file the invocations are appended to
+#   MOCK_RM_PASSTHROUGH          "false" to record without removing anything, for
+#                                a test about what was asked rather than about
+#                                what it did (default "true")
+#   MOCK_RM_OUTPUT               what it prints (on stderr when it fails)
+#   MOCK_RM_EXIT_CODE            exit code. Set, the real rm is not run at all :
+#                                a failure is simulated rather than provoked
+
+if [ -n "${MOCK_RM_CALL_LOG:-}" ]; then
+  printf '%s\n' "rm${*:+ $*}" >> "$MOCK_RM_CALL_LOG"
+fi
+
+if [ -n "${MOCK_RM_EXIT_CODE:-}" ] && [ "$MOCK_RM_EXIT_CODE" -ne 0 ]; then
+  printf '%s' "${MOCK_RM_OUTPUT:-rm: cannot remove the file}" >&2
+  exit "$MOCK_RM_EXIT_CODE"
+fi
+
+if [ -n "${MOCK_RM_OUTPUT:-}" ]; then
+  printf '%s\n' "$MOCK_RM_OUTPUT"
+fi
+
+if [ "${MOCK_RM_PASSTHROUGH:-true}" != "true" ]; then
+  exit 0
+fi
+
+command -p rm "$@"

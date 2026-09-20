@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "useradd" used by the test suite.
+#
+# The entrypoint calls "adduser" today. On the distributions the image is built
+# from, "adduser" is a compatibility symbolic link to "useradd" whose options
+# are not the ones Debian's own adduser takes, which is one of the reasons a
+# later pull request is expected to call useradd directly : this mock is here so
+# that the day it does, the tests it needs already exist.
+#
+# Same contract as mocks/adduser, read from its own variables so that a test can
+# tell which of the two an entrypoint actually called.
+#
+# Recognized environment variables:
+#   MOCK_USERADD_CALL_LOG        file the invocations are appended to
+#   MOCK_USERADD_PASSWD_FILE     passwd file the created account is appended to
+#   MOCK_USERADD_OUTPUT          what it prints (on stderr when it fails)
+#   MOCK_USERADD_EXIT_CODE       exit code (default 0)
+#   MOCK_USERADD_SECOND_EXIT_CODE   exit code returned from the
+#                                MOCK_USERADD_SWITCH_AFTER_CALLS+1-th call onwards
+#   MOCK_USERADD_SWITCH_AFTER_CALLS  when to switch (default 1)
+
+if [ -n "${MOCK_USERADD_CALL_LOG:-}" ]; then
+  printf '%s\n' "useradd${*:+ $*}" >> "$MOCK_USERADD_CALL_LOG"
+fi
+
+EXIT_CODE="${MOCK_USERADD_EXIT_CODE:-0}"
+if [ -n "${MOCK_USERADD_SECOND_EXIT_CODE:-}" ] && [ -n "${MOCK_USERADD_CALL_LOG:-}" ]; then
+  # The current call is already in the log, so this counts it too
+  CALL_NUMBER=$(wc -l < "$MOCK_USERADD_CALL_LOG")
+  if [ "$CALL_NUMBER" -gt "${MOCK_USERADD_SWITCH_AFTER_CALLS:-1}" ]; then
+    EXIT_CODE="$MOCK_USERADD_SECOND_EXIT_CODE"
+  fi
+fi
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+  printf '%s' "${MOCK_USERADD_OUTPUT:-useradd: refused}" >&2
+  exit "$EXIT_CODE"
+fi
+
+[ -n "${MOCK_USERADD_OUTPUT:-}" ] && printf '%s\n' "$MOCK_USERADD_OUTPUT"
+
+# The username is the first argument that is not an option, and an option's own
+# value is skipped with it : "useradd -s /bin/false omsauser" creates omsauser,
+# not /bin/false
+USERNAME=""
+SKIP_NEXT=false
+for ARGUMENT in "$@"; do
+  if $SKIP_NEXT; then
+    SKIP_NEXT=false
+    continue
+  fi
+  case "$ARGUMENT" in
+    --) continue ;;
+    # The short options that take a value of their own, which is the next
+    # argument and is therefore not the username
+    -b | -c | -d | -e | -f | -g | -G | -k | -K | -p | -R | -s | -u | -Z)
+      SKIP_NEXT=true
+      continue
+      ;;
+    -*) continue ;;
+    *) USERNAME="$ARGUMENT"; break ;;
+  esac
+done
+
+if [ -n "${MOCK_USERADD_PASSWD_FILE:-}" ] && [ -n "$USERNAME" ] && [ -f "$MOCK_USERADD_PASSWD_FILE" ]; then
+  printf '%s:x:1000:1000::/home/%s:/bin/bash\n' "$USERNAME" "$USERNAME" >> "$MOCK_USERADD_PASSWD_FILE"
+fi
+
+exit 0

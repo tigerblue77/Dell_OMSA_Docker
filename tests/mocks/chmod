@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "chmod" used by the test suite.
+#
+# Unlike the other mocks, this one does the real thing by default : it records
+# the invocation and then hands it to the system's own chmod. Two reasons, and
+# the first is the one that matters.
+#
+# The entrypoint makes /etc/rc.local executable, and a test asserting that it
+# did should be able to read the bit back off the file rather than off a log --
+# a log only says the command was issued, while the mode says it took. Every
+# path the entrypoint passes has been rewritten into $TEST_ROOT before it runs,
+# so the real chmod applied here only ever reaches a file this run created.
+#
+# The second is that the suite itself needs a working chmod : the mocks are
+# first in the PATH for the whole test case, so a chmod that refused to do
+# anything would take the harness's own calls with it. The harness uses
+# "command -p" for its own, and this passthrough is what keeps a case that calls
+# chmod directly honest as well.
+#
+# Recognized environment variables:
+#   MOCK_CHMOD_CALL_LOG          file the invocations are appended to
+#   MOCK_CHMOD_PASSTHROUGH       "false" to record without changing any mode, for
+#                                a test about what was asked rather than about
+#                                what it did (default "true")
+#   MOCK_CHMOD_OUTPUT            what it prints (on stderr when it fails)
+#   MOCK_CHMOD_EXIT_CODE         exit code. Set, the real chmod is not run at all :
+#                                a failure is simulated rather than provoked
+
+if [ -n "${MOCK_CHMOD_CALL_LOG:-}" ]; then
+  printf '%s\n' "chmod${*:+ $*}" >> "$MOCK_CHMOD_CALL_LOG"
+fi
+
+if [ -n "${MOCK_CHMOD_EXIT_CODE:-}" ] && [ "$MOCK_CHMOD_EXIT_CODE" -ne 0 ]; then
+  printf '%s' "${MOCK_CHMOD_OUTPUT:-chmod: cannot access the file}" >&2
+  exit "$MOCK_CHMOD_EXIT_CODE"
+fi
+
+if [ -n "${MOCK_CHMOD_OUTPUT:-}" ]; then
+  printf '%s\n' "$MOCK_CHMOD_OUTPUT"
+fi
+
+if [ "${MOCK_CHMOD_PASSTHROUGH:-true}" != "true" ]; then
+  exit 0
+fi
+
+command -p chmod "$@"
