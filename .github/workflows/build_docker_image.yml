@@ -1,0 +1,404 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Build Docker image
+
+# The only other workflow here builds and pushes on a push to master, so nothing
+# has ever built this Dockerfile on a pull request -- and the last push to master
+# was March 2023. Between then and now the AlmaLinux tag it starts from and the
+# Dell repository it installs from have both moved underneath it, with nothing in
+# this repository placed to notice. This workflow is what notices (issue #14) :
+# it builds, measures and smoke tests the image on every pull request, and never
+# touches a registry.
+#
+# Issue #9 says what the first run is expected to find -- "almalinux:latest" is
+# AlmaLinux 10 now, and Dell publishes no srvadmin for EL10 -- so this is written
+# to build the Dockerfile exactly as it stands and let it fail if it fails. A red
+# run here is the evidence that issue's fix needs, not something to design
+# around.
+on:
+  # Branches are covered by their pull request. Without this, every push to a
+  # branch that has one builds the same tree twice
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only, deliberately and permanently. Publishing belongs to
+# "build_and_publish_docker_image.yml", which must stay the only workflow in this
+# repository holding registry credentials : this one needs none, so it is given
+# none
+permissions:
+  contents: read
+
+env:
+  # Tags that exist only inside the runner. Nothing here logs in anywhere, so
+  # none of these names is ever pushed and none has to be unique off this machine
+  IMAGE_TAG: dell_omsa:ci
+  # The two containers are named rather than anonymous so that the cleanup step
+  # at the bottom can find and remove them even when the step that created one
+  # was killed before it could
+  REFUSAL_CONTAINER: dell_omsa_ci_refusal
+  WEB_SERVER_CONTAINER: dell_omsa_ci_web_server
+
+jobs:
+  # The build and the smoke tests deliberately share one job. "load: true" leaves
+  # the built image in the runner's own Docker daemon, so every step below simply
+  # uses it. Splitting them in two would mean "docker save" into an artifact of
+  # several hundred megabytes, uploaded and downloaded again, and would buy
+  # nothing but a second line in the checks list -- while making a build failure
+  # read as a skipped job rather than as the red step that actually broke
+  build:
+    name: Build the image and smoke test it
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        # The runner's implicit shell for Linux is "bash -e", without pipefail.
+        # Several steps below pipe "docker" into something else, and without
+        # pipefail a pipeline reports its last command's status, so a docker
+        # failure piped into "sort" or "tail" would be read as a success
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Deliberately before the build rather than after it. The Dockerfile says
+      # "FROM almalinux:latest", and what that tag resolves to on the day of the
+      # build is the single most useful thing this workflow can record : if the
+      # build fails, it fails because of whatever the tag has moved to, and a
+      # step placed after the build would never run to say what that was.
+      #
+      # Buildx resolves the tag itself when it builds, so this is a second
+      # lookup a few seconds apart rather than a readout of the build's own
+      # resolution. The two differ only if the tag moves in between.
+      #
+      # Reading the FROM line means handling the two shapes this Dockerfile has
+      # worn. Today it is a plain "FROM <image>". The fix for #9 turns it into
+      #
+      #     ARG BASE_IMAGE=almalinux:9
+      #     FROM ${BASE_IMAGE}
+      #
+      # so that the publishing workflow can pass the exact digest it resolved
+      # rather than letting the FROM line re-resolve a minute later. A bare
+      # "awk '{ print $2 }'" then yields the literal string "${BASE_IMAGE}",
+      # which "docker pull" cannot resolve -- and it fails eleven seconds in,
+      # before the build, which is how this was found rather than reasoned out.
+      #
+      # So a FROM naming a variable is followed back to that variable's ARG
+      # default. Anything else -- a variable with no default, a FROM this parser
+      # does not understand -- is a loud failure here rather than a confusing
+      # one three steps later. What is deliberately NOT handled is a --platform
+      # flag in front of the image or an "AS <stage>" behind it : this
+      # Dockerfile has a single unnamed stage, and a parser pretending to
+      # understand multi-stage builds it has never seen would be worse than one
+      # that refuses
+      - name: Record what the base image tag resolves to today
+        run: |
+          base_image=$(grep --max-count=1 --extended-regexp '^[[:space:]]*FROM[[:space:]]' Dockerfile | awk '{ print $2 }')
+
+          case "$base_image" in
+            '${'*'}' | '$'*)
+              base_image_argument=${base_image#\$}
+              base_image_argument=${base_image_argument#\{}
+              base_image_argument=${base_image_argument%\}}
+              echo "The Dockerfile's FROM names the build argument $base_image_argument, following it back to its default"
+              # "|| true" so that a variable with no ARG default reaches the guard below
+              # and fails with its message. Without it, pipefail plus the step's own
+              # "set -e" kill the step on the failed grep, one line early and silent --
+              # which is the failure mode this whole block exists to avoid
+              base_image=$(grep --max-count=1 --extended-regexp "^[[:space:]]*ARG[[:space:]]+${base_image_argument}=" Dockerfile |
+                sed --regexp-extended "s/^[[:space:]]*ARG[[:space:]]+${base_image_argument}=//" || true)
+              ;;
+          esac
+
+          case "$base_image" in
+            '' | *'$'*)
+              echo "::error::could not resolve the Dockerfile's base image; the FROM line reads '$(grep --max-count=1 --extended-regexp '^[[:space:]]*FROM[[:space:]]' Dockerfile)'"
+              exit 1
+              ;;
+          esac
+
+          echo "The Dockerfile starts from $base_image"
+
+          docker pull --quiet "$base_image"
+          base_digest=$(docker image inspect --format '{{ if .RepoDigests }}{{ index .RepoDigests 0 }}{{ else }}(the registry served no digest){{ end }}' "$base_image")
+          echo "which resolves today to $base_digest"
+
+          {
+            echo "## Base image"
+            echo
+            echo "The Dockerfile starts from \`$base_image\`, which the registry resolves today to:"
+            echo
+            echo '```'
+            echo "$base_digest"
+            echo '```'
+            echo
+            echo "and that image identifies itself as:"
+            echo
+            echo '```'
+            docker run --rm "$base_image" cat /etc/os-release
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # "push: false" is the whole point of the file : this workflow exists to
+      # find out whether the Dockerfile still builds, not to publish anything.
+      # The Dockerfile is built exactly as it stands on the branch -- no pinned
+      # base, no build argument, no workaround. Whatever it does here is what it
+      # would do on a "docker build" anywhere else today
+      - name: Build the Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          # Exports the result into the runner's Docker daemon, which is what
+          # lets every step below inspect it and run it
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          # "ignore-error=true" covers exactly one case : a pull request opened
+          # from a fork is given a read-only Actions cache token, and without it
+          # the cache *export* failing after a successful build turns that build
+          # red for a reason that has nothing to do with the image. It changes
+          # nothing about the build itself, which still fails when it fails
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      # Issue #5 asks whether a different base image would make this image
+      # smaller. A number printed on every build turns that question from an
+      # opinion into a measurement, and the per-layer breakdown says which
+      # instruction is worth arguing about. Largest first, because the three
+      # lines at the top are the only ones anybody reads
+      - name: Measure the image size
+        run: |
+          total_bytes=$(docker image inspect --format '{{ .Size }}' "$IMAGE_TAG")
+          total_human=$(numfmt --to=iec-i --format='%.1f' --suffix=B "$total_bytes")
+          echo "$IMAGE_TAG totals $total_human ($total_bytes bytes)"
+
+          {
+            echo "## Image size"
+            echo
+            echo "**$total_human** ($total_bytes bytes), uncompressed, as the daemon stores it. A registry would hold rather less than this, since it keeps the layers compressed."
+            echo
+            echo "| Size | Instruction |"
+            echo "| ---: | :--- |"
+            # "--human=false" makes .Size the raw byte count, which is what "sort
+            # -rn" needs ; the awk below is what turns it back into something
+            # readable. The "\t" is docker's own output formatter escape, which
+            # it expands to a real tab before the template runs -- a literal tab
+            # here would work too and be invisible in every editor. The pipe
+            # character has to be escaped or it ends the table cell it appears
+            # in, and "wget ... | bash" is one of the lines this prints
+            docker history --no-trunc --human=false --format '{{ .Size }}\t{{ .CreatedBy }}' "$IMAGE_TAG" \
+              | sort -rn \
+              | awk -F '\t' '
+                  function human(bytes,   units, scale, value) {
+                    split("B KiB MiB GiB TiB", units, " ")
+                    scale = 1
+                    value = bytes
+                    while (value >= 1024 && scale < 5) { value = value / 1024; scale++ }
+                    return sprintf("%.1f%s", value, units[scale])
+                  }
+                  function escape_pipes(text,   parts, count, i, result) {
+                    count = split(text, parts, /\|/)
+                    result = parts[1]
+                    for (i = 2; i <= count; i++) { result = result "\\|" parts[i] }
+                    return result
+                  }
+                  {
+                    size = $1
+                    step = $2
+                    sub(/^RUN[[:space:]]+\/bin\/sh -c[[:space:]]+/, "", step)
+                    sub(/^\/bin\/sh -c[[:space:]]+#\(nop\)[[:space:]]*/, "", step)
+                    sub(/^\/bin\/sh -c[[:space:]]+/, "", step)
+                    sub(/[[:space:]]*#[[:space:]]*buildkit$/, "", step)
+                    if (step == "") { step = "(no recorded instruction)" }
+                    if (length(step) > 140) { step = substr(step, 1, 137) "..." }
+                    printf "| %s | `%s` |\n", human(size), escape_pipes(step)
+                  }'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Two things in one step because they are the same question asked twice :
+      # what the image says about itself. The listing is for whoever reads the
+      # summary, the assertion is what stops a label going missing unnoticed.
+      #
+      # The Dockerfile sets exactly one OCI label today, "authors". A LABEL line
+      # added to the Dockerfile wants its assertion added here in the same pull
+      # request, or the label is guarded by nothing
+      - name: Check the OCI labels the Dockerfile sets
+        run: |
+          {
+            echo "## Labels"
+            echo
+            echo '```'
+            docker image inspect --format '{{ range $key, $value := .Config.Labels }}{{ $key }}={{ $value }}{{ println }}{{ end }}' "$IMAGE_TAG"
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          authors=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.authors" }}' "$IMAGE_TAG")
+          if [ "$authors" != "tigerblue77" ]; then
+            echo "::error::org.opencontainers.image.authors should be \"tigerblue77\" on the built image, and is \"$authors\"."
+            exit 1
+          fi
+          echo "org.opencontainers.image.authors = $authors"
+
+      # The cheapest thing that is true of a working image and false of an image
+      # where the Dell packages did not install : the two commands the README
+      # tells people to run resolve on PATH. The Dockerfile puts them there with
+      # an ENV line rather than in /usr/bin, so this checks the ENV line as much
+      # as it checks the packages
+      - name: Check that omreport and omconfig are on PATH inside the image
+        run: |
+          for tool in omreport omconfig; do
+            resolved_path=$(docker run --rm "$IMAGE_TAG" sh -c "command -v $tool") || {
+              echo "::error::\"$tool\" is not on PATH inside the image."
+              exit 1
+            }
+            echo "$tool resolves to $resolved_path"
+          done
+
+      # "about" is the one omreport verb that asks the local installation what it
+      # is rather than asking a Dell server anything, so it is the one this can
+      # honestly assert on a GitHub runner with no PowerEdge underneath it.
+      #
+      # Deliberately run unprivileged and with no hardware mounted : if it turns
+      # out that "omreport about" needs either, that is a finding worth having
+      # written down rather than something to smother with "|| true". The first
+      # CI run is what settles it
+      - name: Check that "omreport about" prints a version
+        run: |
+          status=0
+          output=$(docker run --rm "$IMAGE_TAG" omreport about 2>&1) || status=$?
+          echo "$output"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::\"omreport about\" exited with status $status inside the image."
+            exit 1
+          fi
+
+          if ! grep --extended-regexp --quiet 'Version[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+' <<< "$output"; then
+            echo "::error::\"omreport about\" succeeded but printed no version number."
+            exit 1
+          fi
+
+      # configure_and_run_Dell_OMSA.sh refuses to go any further without both
+      # variables, and everything after that refusal in the script assumes they
+      # are set. A broken guard would not fail loudly, it would create a user
+      # named "" and then hand the container to systemd, so this asserts the
+      # refusal rather than trusting it.
+      #
+      # The "timeout" is not a hedge, it is what keeps a broken guard from
+      # hanging the job for 45 minutes : with the guard gone the script reaches
+      # "exec /sbin/init" and never returns. Status 124 is timeout's own, and is
+      # rejected below precisely so that a hang cannot pass as "exited non-zero"
+      - name: Check that the container refuses to start without OMSA_username and OMSA_password
+        run: |
+          status=0
+          output=$(timeout 60 docker run --rm --name "$REFUSAL_CONTAINER" "$IMAGE_TAG" 2>&1) || status=$?
+          echo "$output"
+
+          if [ "$status" -eq 124 ]; then
+            echo "::error::The container did not exit within 60 seconds with neither OMSA_username nor OMSA_password set : the guard in configure_and_run_Dell_OMSA.sh did not stop it."
+            exit 1
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::The container exited successfully with neither OMSA_username nor OMSA_password set, where it should have refused to start."
+            exit 1
+          fi
+
+          for variable in OMSA_username OMSA_password; do
+            if ! grep --quiet "$variable" <<< "$output"; then
+              echo "::error::The refusal message does not name $variable."
+              exit 1
+            fi
+          done
+          echo "The container refused to start, with status $status, naming both variables."
+
+      # ---------------------------------------------------------------------
+      # Everything above this line is settled : it either holds on a runner or
+      # the image is broken. This last step is not, and it is kept apart for
+      # that reason.
+      #
+      # It starts the container the way the README does and waits for the OMSA
+      # web server to answer on 1311. The image runs systemd as PID 1, which
+      # wants cgroup mounts a container does not normally get ; "--privileged"
+      # is allowed on GitHub's ubuntu-latest runners and usually gives systemd
+      # enough to boot, but "usually" is the whole problem -- whether this is
+      # reliable here is an open question that the first few CI runs will
+      # answer, and nobody can answer it from a desk.
+      #
+      # If it proves flaky, the answer is to delete this step, not to wrap it in
+      # "|| true" or hang "continue-on-error" off it. A test that cannot fail is
+      # worse than no test : it teaches whoever reads the checks list that a
+      # green tick here means nothing.
+      # ---------------------------------------------------------------------
+      - name: Start the container the way the README does and wait for the web server
+        run: |
+          # The README also mounts the host's /lib/modules, which is there for
+          # the Dell drivers to reach real hardware. A runner has none, so the
+          # mount would only add a failure mode to a test that is not about it
+          docker run --detach \
+            --privileged \
+            --name "$WEB_SERVER_CONTAINER" \
+            --env OMSA_username=citest \
+            --env OMSA_password='Ci-Smoke-Test-1311' \
+            --publish 1311:1311 \
+            "$IMAGE_TAG"
+
+          deadline=$(( SECONDS + 240 ))
+          listening=false
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # "gone" rather than "false" when the inspect itself fails : a
+            # container that was removed and one that merely stopped are two
+            # different findings, and the message below prints whichever it was
+            container_state=$(docker inspect --format '{{ .State.Running }}' "$WEB_SERVER_CONTAINER") || container_state=gone
+            if [ "$container_state" != true ]; then
+              echo "The container is no longer running (state: $container_state) : it stopped before the web server ever answered."
+              break
+            fi
+
+            # Any answer at all counts, including an error page : the question is
+            # whether anything is listening, not what it serves. OMSA speaks TLS
+            # on 1311 with a self-signed certificate, hence "--insecure", and the
+            # plain HTTP attempt is there only so a configuration change upstream
+            # would not read as silence
+            if curl --insecure --silent --output /dev/null --max-time 5 'https://127.0.0.1:1311/' \
+            || curl --silent --output /dev/null --max-time 5 'http://127.0.0.1:1311/'; then
+              listening=true
+              break
+            fi
+
+            sleep 5
+          done
+
+          if [ "$listening" != true ]; then
+            echo "::error::The OMSA web server never answered on port 1311 within 240 seconds."
+            echo "----- container state -----"
+            docker ps --all --filter "name=^${WEB_SERVER_CONTAINER}$"
+            echo "----- last 200 lines of container output -----"
+            docker logs "$WEB_SERVER_CONTAINER" 2>&1 | tail --lines=200
+            exit 1
+          fi
+
+          echo "The OMSA web server answered on port 1311."
+
+      # Named containers outlive the step that created them when that step was
+      # killed, and a self-hosted runner would keep them forever. Written as a
+      # test for the container rather than as "docker rm --force ... || true", so
+      # that a removal that genuinely fails still fails this step
+      - name: Remove the containers this job started
+        if: always()
+        run: |
+          for container in "$REFUSAL_CONTAINER" "$WEB_SERVER_CONTAINER"; do
+            if [ -n "$(docker ps --all --quiet --filter "name=^${container}$")" ]; then
+              docker rm --force "$container"
+            fi
+          done
