@@ -1,57 +1,765 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
 name: Docker image CI
 
+# Driven by a version tag, where this workflow used to run on every push to
+# master.
+#
+# What that cost : "tigerblue77/dell_omsa:latest" on Docker Hub carries exactly
+# one tag, last pushed on 2023-03-04, and ghcr.io/tigerblue77/dell_omsa carries
+# the same single "latest". There is no way to pin a working image, no way to
+# roll back to one, and no record anywhere of which AlmaLinux or which OMSA any
+# published build was made of. A user whose deployment breaks has nothing to go
+# back to, and a maintainer looking at a broken "latest" has nothing to compare
+# it against.
+#
+# A version tag fixes both halves : "v1.0" names a set of bytes that keeps
+# existing after "latest" has moved on, and the labels stamped below record what
+# went into it. Publishing on every push to master could not do that - every
+# push overwrote the only tag there was.
+#
+# Note what is deliberately NOT here : "paths-ignore". The sibling repository
+# carries one, and its effect on a TAG push is undocumented - GitHub's reference
+# describes path filters against branch pushes and says nothing about the diff a
+# tag push is supposed to be filtered on. A release build that silently does not
+# run is the single worst failure this workflow can have, and a tag cut on a
+# commit that only touched README.md is still a release someone asked for. So
+# the tag is built, whatever it points at.
+#
+# Two tag patterns and not one. A GitHub filter pattern gives "." no special
+# meaning and has no grouping - "+" repeats the single preceding character or
+# bracket class - so "v[0-9]+.[0-9]+" matches exactly two components and
+# nothing else. A pushed "v1.0.1" therefore started no run at all : no build, no
+# annotation, nothing in the Actions tab saying why. That is the same silent
+# no-op the missing "paths-ignore" above is declined for, and it is worse here
+# because the tag exists afterwards, looking released. A patch component is also
+# the thing you want when a release's own source needs a fix and Dell has not
+# moved, so it is accepted rather than forbidden. The documented example for
+# this syntax is "v[12].[0-9]+.[0-9]+", which GitHub's own reference gives as
+# matching "v1.10.1" - three components need their own pattern.
+#
+# The two candidate walks that read the git tag list - the "latest" gate below
+# and the release lookup in "Published image refresh" - filter it through the
+# same two shapes, so the versions those gates weigh are exactly the versions a
+# tag push here can publish. A "v2.0-rc1" sitting in git is considered by
+# neither
 on:
   push:
-    branches: [ master ]
-    paths-ignore:
-      - '**/README.md'
+    tags:
+      - "v[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  # Lets a release build be re-fired from the Actions tab against a tag that
+  # already exists, instead of having to delete and re-push it. This is the
+  # documented recovery path for a build that died before publishing
+  workflow_dispatch:
+
+# Without this block the whole workflow runs on the repository-wide default
+# token. This one grants only what its two publishing steps need : "contents"
+# for the GitHub release the last steps create and for the lookup that decides
+# whether they have to, "packages" for the image pushed to ghcr.io. Everything
+# else the default token may carry (issues, pull requests, deployments...) is
+# dropped
+permissions:
+  contents: write
+  packages: write
+
+# Two releases building at the same time would each ask "is a higher version
+# already published ?" before the other had finished pushing, both would get
+# "no", both would push "latest", and which one landed last would be settled
+# separately in each registry - that is how the sibling repository ended up with
+# "latest" on two different versions in its two registries at the same moment,
+# and it needed a two-hundred-line reconciliation script afterwards to put it
+# right.
+#
+# The group name is shared with "Published image refresh", deliberately and by
+# spelling : a concurrency group is repository-wide and matched on its name
+# alone, so naming the same one in both files is the whole mechanism. Two names
+# serialised releases against releases and refreshes against refreshes, and left
+# the pair that actually moves "latest" in opposite directions free to run at
+# once : the refresh decides to rebuild from v1.0 and starts a ten-minute build,
+# the maintainer pushes v1.1, the release publishes v1.1 and "latest", and the
+# refresh's build finishes and pushes a "latest" made of v1.0 over the top of
+# it. "latest" then serves the PREVIOUS release. It repairs itself the next
+# night - except when Dell has moved too, because the refresh is then blocked
+# and the wrong "latest" stays there until somebody cuts a tag. One name covers
+# every pair that can publish, which is what "removes the race at its source"
+# has to mean : anything that pushes this image joins this group.
+#
+# The cost, stated rather than discovered : GitHub keeps at most one run pending
+# per group, so a third run queued while one runs and one waits cancels the
+# waiting one - and the third can now be a nightly refresh. A cancelled release
+# leaves its tag with no image behind it, the cancelled run is visible in the
+# Actions tab, and re-firing it from there publishes it ; a cancelled refresh
+# costs one night and the next one picks the same work up. A release also waits
+# on a refresh that is already building, which is minutes, against the hours the
+# reconciliation above took.
+concurrency:
+  group: publish-docker-image
+  cancel-in-progress: false
+
+env:
+  # Dell's own package repository, the one "bootstrap.cgi" wires into dnf
+  # inside the Dockerfile. Read here before the build so that a release stops on
+  # a clear message rather than on a dnf error ten minutes in, and so that the
+  # version that went into the image is recorded as a label - which is what
+  # "Published image refresh" compares against to notice that Dell has moved
+  DELL_REPOSITORY_URL: https://linux.dell.com/repo/hardware/dsu/os_dependent
 
 jobs:
   build:
     name: Build and publish Docker image to Docker Hub and GitHub Containers Repository
     runs-on: ubuntu-latest
+    # Bounded so a wedged build cannot hold the concurrency group above for the
+    # six hours a job is allowed by default. The image is around 1.5 GB and
+    # builds in well under a quarter of this
+    timeout-minutes: 60
+    # The workflow_dispatch ref dropdown offers branches too. Publishing an image
+    # built from a branch would move "latest" onto unreleased code, so only run
+    # when the ref is a version tag
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      # No test job runs ahead of this one, where the sibling repository gates
+      # its release on a suite. That is not an oversight either : OMSA talks to
+      # a real PowerEdge over IPMI and to its storage controllers over the PCI
+      # bus, and a GitHub-hosted runner is a virtual machine with neither. There
+      # is no meaningful test of this image that a runner can perform.
+      #
+      # What does gate the release is the build itself. "dnf install
+      # srvadmin-all" has to resolve against Dell's repository for the image to
+      # exist at all, which is precisely the thing that had been failing
+      # unnoticed since the base moved to an EL major Dell publishes no OMSA for
+      # (#9) - unnoticed because nothing built this file except a push to master,
+      # and nobody had pushed one
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The tags are the list of versions that could outrank this one, which
+          # the "latest" check below walks. The default single-commit fetch does
+          # not bring them along
+          fetch-depth: 0
 
-    - name: Remove "_Docker" suffix from GitHub repository name to use it as image name
-      uses: mad9000/actions-find-and-replace-string@3
-      id: docker_image_name
-      with:
-        source: ${{ github.repository }}
-        find: '_Docker'
-        replace: ''
+      # One line of shell where this used to be a third-party action
+      # (mad9000/actions-find-and-replace-string) pulled in to remove one
+      # substring from one string. Every action referenced here runs inside the
+      # job that holds the Docker Hub credentials, so each one is somebody whose
+      # repository could take those credentials if it were compromised. Paying
+      # that for a parameter expansion bash has had since the nineties was a bad
+      # trade
+      - name: Calculate final Docker image name
+        id: docker_image_name
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ github.repository }}"
+          FINAL_NAME="${IMAGE_NAME/_Docker/}"
+          # Lowercased once, here, rather than at each of the places that go on
+          # to use it. Registry APIs reject the repository's own capitalisation,
+          # docker/metadata-action lowercases what it is given anyway, and the
+          # published repositories are already "tigerblue77/dell_omsa" on both
+          # registries. One spelling, so there is no second place to forget
+          echo "value=${FINAL_NAME,,}" >> "$GITHUB_OUTPUT"
 
-    - name: Docker meta
-      id: meta
-      uses: docker/metadata-action@v4
-      with:
-        images: |
-          ${{ steps.docker_image_name.outputs.value }}
-          ghcr.io/${{ steps.docker_image_name.outputs.value }}
-        tags: type=raw,value=latest
-        
-    - name: Login to Docker Hub
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v2
-      with:
-        registry: ghcr.io
-        username: ${{ github.repository_owner }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and publish Docker image
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        file: ./Dockerfile
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+      # Resolved once here and passed to the build as a build argument, instead
+      # of letting the FROM line resolve "almalinux:9" a second time when the
+      # build starts. The two resolutions are a minute apart and AlmaLinux
+      # republishes that tag whenever it rebuilds, so an image could be built on
+      # one set of bytes and labelled with the digest of another - and the label
+      # is the whole basis on which "Published image refresh" later decides
+      # whether the base moved. A label that describes a different image than
+      # the one underneath it is worse than no label, because it is believed.
+      #
+      # This REQUIRES the Dockerfile to carry "ARG BASE_IMAGE=almalinux:9" above
+      # its FROM line, and this workflow has to merge after the pull request
+      # that adds it. An earlier version of this comment claimed the opposite -
+      # that the parser reading a plain FROM line made the two mergeable in any
+      # order - and that was wrong twice over. Run against master's Dockerfile,
+      # which is "FROM almalinux:latest", the parser does survive and the
+      # release does not : "latest" is not an EL major, so the OMSA step below
+      # stops the run before anything is built, with no image and no release
+      # note. And on a Dockerfile that named a real EL major on its FROM line -
+      # "FROM almalinux:9" - everything would pass while "--build-arg
+      # BASE_IMAGE" went nowhere, the FROM line re-resolved at build time, and
+      # the base.digest label recorded a digest that may describe other bytes.
+      # A silently ignored build argument is the worse of the two, so the parser
+      # reports which shape it found and the step below refuses the second one
+      # rather than building through it. What is equally NOT safe is renaming
+      # the ARG on one side only : same silence, same consequence.
+      #
+      # Sits between the logins and "Docker meta" on purpose : it consumes the
+      # former, because the base lives on Docker Hub where anonymous requests
+      # are rate limited per IP and runners share theirs, and the latter consumes
+      # its outputs
+      - name: Resolve the digest of the base image
+        id: base
+        run: |
+          set -euo pipefail
+          # Two fields out, tab separated : the reference, and the name of the
+          # ARG it came from when FROM named a variable. The parser already knew
+          # which of the two shapes it was looking at and used to throw that
+          # away, which is exactly the knowledge needed to tell a Dockerfile
+          # that will honour "--build-arg BASE_IMAGE" from one that will ignore
+          # it without a word
+          PARSED="$(awk '
+            toupper($1) == "ARG" {
+              eq = index($2, "=")
+              if (eq > 1) default_of[substr($2, 1, eq - 1)] = substr($2, eq + 1)
+            }
+            toupper($1) == "FROM" {
+              ref = $2
+              name = ""
+              if (ref ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) {
+                name = ref
+                gsub(/^\$\{?|\}$/, "", name)
+                ref = default_of[name]
+              }
+              print ref "\t" name
+              exit
+            }' Dockerfile)"
+          BASE_IMAGE="${PARSED%%$'\t'*}"
+          BASE_ARG="${PARSED#*$'\t'}"
+          if [ -z "$BASE_IMAGE" ]; then
+            echo "::error::Could not work out the base image from the Dockerfile"
+            exit 1
+          fi
+          # See the comment above : without an ARG-declared base the argument
+          # passed to the build below is accepted, ignored, and the FROM line
+          # re-resolves on its own. Nothing fails, and the base.digest label
+          # stops being a fact about the image while still being believed by the
+          # refresh workflow that reads it. Refused here rather than published
+          if [ -z "$BASE_ARG" ]; then
+            echo "::error::The Dockerfile names its base on the FROM line ('$BASE_IMAGE') rather than through an ARG, so '--build-arg BASE_IMAGE' would be silently ignored and org.opencontainers.image.base.digest would describe a base this image was not built on. Declare 'ARG BASE_IMAGE=almalinux:9' above the FROM line and write 'FROM \${BASE_IMAGE}'"
+            exit 1
+          fi
+          # Declared through an ARG is half of what makes the build arg below
+          # land ; the other half is that the ARG carries the name this workflow
+          # hardcodes on it. Docker accepts a --build-arg matching no ARG with a
+          # warning rather than an error, so a renamed ARG reaches exactly the
+          # silence the check above refuses - the FROM line re-resolving its own
+          # base at build time, under a base.digest label that then describes
+          # bytes this image was not built on, which the refresh workflow reads
+          # back as fact. The name is already parsed out three lines up, so what
+          # the comment beside the build step calls "equally NOT safe" costs one
+          # comparison to actually refuse
+          if [ "$BASE_ARG" != "BASE_IMAGE" ]; then
+            echo "::error::The Dockerfile takes its base from 'ARG $BASE_ARG', and this workflow builds with '--build-arg BASE_IMAGE'. Docker would accept that argument, ignore it, and resolve the base a second time at build time. Rename the ARG to BASE_IMAGE"
+            exit 1
+          fi
+          echo "image=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "arg=$BASE_ARG" >> "$GITHUB_OUTPUT"
+
+          # Drop an existing digest, then drop a tag, then pin to the digest just
+          # resolved. A colon only introduces a tag when it sits in the last path
+          # segment : in "registry:5000/image" it is a host and a port
+          pin_to_digest() {
+            local REF="${BASE_IMAGE%%@*}" REPO
+            case "${REF##*/}" in
+              *:*) REPO="${REF%:*}" ;;
+              *)   REPO="$REF" ;;
+            esac
+            printf '%s@%s\n' "$REPO" "$1"
+          }
+
+          # Docker Hub answers 429 once the pull quota for the current window is
+          # spent. The job is logged in above, so the quota is the account's
+          # rather than the runner's shared address, but a transient failure here
+          # would cost a whole release for nothing. Retrying rides out a spike ;
+          # a quota genuinely exhausted, or a registry genuinely down, outlives
+          # the waits and fails the run, which is the honest outcome.
+          #
+          # The answer is checked and not just the exit status. "jq -r .digest"
+          # prints the four letters "null" and exits 0 when the key is not
+          # there, so an answer with no digest in it used to be written out as
+          # digest=null, pinned as "almalinux@null", and reported as a success.
+          # The build would have failed on the invalid reference a step later,
+          # loudly but pointing at the wrong thing. "// empty" turns the missing
+          # key into an empty string and the shape test turns everything else
+          # that is not a digest into a retry, so the only value that leaves
+          # this step is one that can be pinned to
+          for DELAY in 60 300 0; do
+            if MANIFEST="$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest}}')"; then
+              DIGEST="$(printf '%s' "$MANIFEST" | jq -r '.digest // empty')"
+              if printf '%s' "$DIGEST" | grep -qE '^[a-z0-9]+:[0-9a-f]{32,}$'; then
+                echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+                # What the build below is actually given, so the label and the
+                # bytes underneath the image describe the same base
+                echo "pinned=$(pin_to_digest "$DIGEST")" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::$BASE_IMAGE resolved to no usable digest (got '${DIGEST:-nothing}')"
+            fi
+            if [ "$DELAY" -gt 0 ]; then
+              echo "::warning::Could not resolve $BASE_IMAGE, retrying in ${DELAY}s"
+              sleep "$DELAY"
+            fi
+          done
+          echo "::error::Could not resolve the digest of $BASE_IMAGE"
+          exit 1
+
+      # Every input to this image lives outside this repository : the AlmaLinux
+      # base above, and Dell's repository here. A commit is not what makes this
+      # image stale - not committing is. So the release records what it was built
+      # from on both sides, and "Published image refresh" watches both.
+      #
+      # Two things are read, and the choice of which two is the whole design.
+      #
+      # The srvadmin/ TREE, because its absence is the failure that went
+      # unnoticed for three and a half years : Dell publishes racadm and DSU for
+      # every OS it supports, but srvadmin/ only where OMSA exists.
+      # os_dependent/RHEL10_64/ has metaRPMS/, racadm/ and repodata/ and no
+      # srvadmin/ at all, where RHEL8_64/ and RHEL9_64/ have both - so an image
+      # whose base moved to EL10 gets a repository that resolves perfectly and
+      # has no "srvadmin-all" in it. Read here, the release stops on a sentence
+      # naming the cause instead of on a dnf error several minutes into the
+      # build.
+      #
+      # The VERSION of srvadmin-all, because that is the package the Dockerfile
+      # installs and therefore the one number that describes the payload. Note
+      # what is deliberately not watched : the thirty component RPMs under
+      # srvadmin/, and the nine other meta-RPMs beside srvadmin-all. They move on
+      # their own schedules - srvadmin-idrac is on 11.4.0.0-1435 today where
+      # everything else is on 11.1.0.0-5773 - so watching them would fire on
+      # changes that never reach this image, and a check that fires on things
+      # that do not matter is a check people stop reading. Neither is the
+      # directory's modification time : every directory in os_dependent/ carries
+      # the same timestamp to the minute, which is a mirror sync touching all of
+      # them, not Dell publishing anything.
+      #
+      # Resolved BEFORE the build rather than read back out of the built image
+      # afterwards, which would be exact. The window that opens is Dell
+      # publishing between this step and the build, leaving the label one version
+      # behind the bytes ; the refresh workflow then reports a drift that is
+      # already in the image, somebody looks and closes it. Read afterwards
+      # instead, the same window leaves the label AHEAD of the bytes and the
+      # drift is never reported at all. One spurious issue, in a minutes-wide
+      # window, for a repository that publishes roughly once a year, against a
+      # miss that is silent : the trade is not close
+      - name: Resolve the version of Dell's OMSA packages
+        id: omsa
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="${{ steps.base.outputs.image }}"
+
+          # Which EL major the base is, read off its tag. AlmaLinux 9 is EL9 and
+          # its tag says so, which is what makes this derivable rather than a
+          # second thing to keep in step by hand. Same last-path-segment rule as
+          # above : a colon is only a tag separator in the last segment
+          REF="${BASE_IMAGE%%@*}"
+          case "${REF##*/}" in
+            *:*) BASE_TAG="${REF##*:}" ;;
+            *)   BASE_TAG="" ;;
+          esac
+          EL_MAJOR="${BASE_TAG%%.*}"
+          if ! printf '%s' "$EL_MAJOR" | grep -qE '^[0-9]+$'; then
+            # "almalinux:latest" lands here, and so does a base pinned straight
+            # to a digest. Both are states in which nobody can say which OMSA
+            # tree this image is supposed to resolve against, which is the
+            # question #9 turned on
+            echo "::error::Could not work out which EL major '$BASE_IMAGE' is. Pin the base to an EL major, the way the Dockerfile's ARG BASE_IMAGE does"
+            exit 1
+          fi
+
+          OS_DIRECTORY_URL="$DELL_REPOSITORY_URL/RHEL${EL_MAJOR}_64"
+
+          # --fail so that an HTTP error is a failure rather than an error page
+          # captured as if it were an index, --location because Dell has moved
+          # this tree behind redirects before, and the retries because a release
+          # is not something to lose to one refused connection
+          fetch() {
+            curl --fail --silent --show-error --location \
+                 --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors "$1"
+          }
+
+          if ! INDEX="$(fetch "$OS_DIRECTORY_URL/")"; then
+            # Unreadable is not "absent", and the two are told apart everywhere
+            # in these workflows. Here they lead to the same place anyway : the
+            # build below installs from this exact server, so a server this step
+            # cannot read is a build that is about to fail regardless, and
+            # failing now says why
+            echo "::error::Could not read $OS_DIRECTORY_URL/. The build installs from that server, so it would fail too"
+            exit 1
+          fi
+
+          # "Dell dropped OMSA for this EL major" is a heavy conclusion to draw
+          # from one substring not being present, and the substring is right
+          # only for as long as this server keeps serving relative hrefs. One
+          # Apache directive away - "srvadmin/" written as
+          # "/repo/hardware/dsu/os_dependent/RHEL9_64/srvadmin/" - and the test
+          # below finds nothing in a tree where everything is still there. So
+          # the index is first asked to prove it parses AT ALL, on two entries
+          # that are present in every one of these directories including the
+          # EL10 one that genuinely has no srvadmin/ : racadm/ and repodata/.
+          # Neither of them present means the bytes are not the index this
+          # parser was written for - an error page, a redirect body, a
+          # restructured listing - and "we cannot read this" is never allowed to
+          # be reported as "Dell removed it"
+          if ! printf '%s' "$INDEX" | grep -qE 'href="(racadm|repodata)/"'; then
+            echo "::error::$OS_DIRECTORY_URL/ does not look like the directory index this workflow parses : it carries neither href=\"racadm/\" nor href=\"repodata/\", both of which every one of Dell's OS directories has. Nothing can be concluded about the srvadmin tree from it"
+            exit 1
+          fi
+
+          if ! printf '%s' "$INDEX" | grep -q 'href="srvadmin/"'; then
+            echo "::error::$OS_DIRECTORY_URL/ carries no srvadmin/ tree, so Dell publishes no OMSA for EL$EL_MAJOR and 'dnf install srvadmin-all' has nothing to resolve against. This is #9. Pin the Dockerfile's base to an EL major Dell still publishes OMSA for"
+            exit 1
+          fi
+
+          if ! META_INDEX="$(fetch "$OS_DIRECTORY_URL/metaRPMS/")"; then
+            echo "::error::Could not read $OS_DIRECTORY_URL/metaRPMS/"
+            exit 1
+          fi
+
+          # Anchored on href= rather than on the link text : Apache truncates a
+          # long file name in the text it displays and leaves the href intact.
+          # Highest first in case Dell ever keeps more than one version there,
+          # which it does not today - one srvadmin-all-*.rpm, ten meta-RPMs,
+          # thirty components under srvadmin/, every one of them x86_64.
+          #
+          # The digit immediately after the prefix is what makes this a VERSION
+          # match rather than a name match. "[^\"]+" also matches a letter, so
+          # "srvadmin-all-debuginfo-11.9.0.0-1.el9.x86_64.rpm" - a sibling of
+          # exactly the shape Dell already ships as srvadmin-storageservices-cli
+          # and srvadmin-server-snmp - parsed as the version
+          # "debuginfo-11.9.0.0-1.el9", and sort -V ranks anything starting with
+          # a letter above every numeric version, so the garbage did not just
+          # get considered, it always won. The label on the published image
+          # would then name a version that does not exist, the refresh workflow
+          # would read that label back as drift the next morning, open an issue
+          # about it and hold every "latest" refresh behind it. Source RPMs are
+          # dropped for the same reason : ".src.rpm" is not this image's payload
+          # and a source package published ahead of the binary would outrank it.
+          # The architecture itself is deliberately NOT constrained - every
+          # package in this tree is x86_64 today, and demanding it would turn a
+          # Dell restructuring into a false "Dell dropped OMSA"
+          VERSION="$(printf '%s' "$META_INDEX" \
+            | grep -oE 'href="srvadmin-all-[0-9][^"]*\.rpm"' \
+            | grep -vE '\.src\.rpm"$' \
+            | sed -E 's/^href="srvadmin-all-//; s/\.[A-Za-z0-9_]+\.rpm"$//' \
+            | sort -V | tail -n 1)" || true
+          if [ -z "$VERSION" ]; then
+            echo "::error::Found no srvadmin-all package in $OS_DIRECTORY_URL/metaRPMS/"
+            exit 1
+          fi
+
+          echo "Dell publishes srvadmin-all $VERSION for EL$EL_MAJOR"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Whether this tag may claim "latest" is decided by asking the REGISTRY
+      # which versions are published, and not by comparing it against the tags
+      # that exist in git. A tag existing in git means someone typed "git tag" ;
+      # it says nothing about an image having come out of it. The sibling
+      # repository learned that the expensive way : a burst of tags whose builds
+      # all died left "latest" stuck two days on an old version, because five
+      # perfectly good builds each declined "latest" on account of a higher tag
+      # that had published nothing.
+      #
+      # Asking the registry also makes a wrong answer temporary. Every later
+      # release re-derives it, so a mistake repairs itself, where a comparison
+      # against git gives the same wrong answer forever - git never changes its
+      # mind.
+      #
+      # This repository has published nothing under any version yet, so the first
+      # release walks nothing and takes "latest" unopposed, which is correct
+      - name: Check whether a higher version is already published
+        id: highest_version
+        run: |
+          set -euo pipefail
+
+          # Read from GHCR and not from Docker Hub. Docker Hub answers 429 once
+          # the pull quota of the window is spent, and every request made there
+          # competes with the base image metadata this build needs ; GHCR reads
+          # are authenticated with GITHUB_TOKEN, carry no pull quota, and the job
+          # is already logged in.
+          # The price, stated plainly : a version that reached Docker Hub but not
+          # GHCR is invisible here. Only a half-failed push can produce one, its
+          # own run is red, and the next release settles it
+          IMAGE="ghcr.io/${{ steps.docker_image_name.outputs.value }}"
+          ERRORS="$RUNNER_TEMP/imagetools-error.txt"
+
+          # Three answers and not two, deliberately : "the registry did not
+          # answer" is not "there is nothing there". 0 published, 1 nothing under
+          # that tag, 2 no usable answer.
+          # Every path returns explicitly, because the caller invokes this on the
+          # left of a "||", which switches errexit off inside the body
+          version_is_published() {
+            if docker buildx imagetools inspect "$IMAGE:$1" --format '{{json .Manifest}}' >/dev/null 2>"$ERRORS"; then
+              return 0
+            fi
+            # The wordings a registry uses for a tag that was never pushed. Note
+            # what is deliberately NOT in that list : "denied" and
+            # "unauthorized". A token that cannot read the package must never
+            # look like an empty registry, that is exactly how "latest" would
+            # walk backwards on a permissions mistake
+            if grep -qiE 'not found|manifest unknown|name unknown' "$ERRORS"; then
+              return 1
+            fi
+            cat "$ERRORS"
+            return 2
+          }
+
+          # "$1 is a strictly higher version than $2". sort -V, not sort :
+          # lexicographically "v1.9" sorts above "v1.19"
+          higher_than() {
+            if [ "$1" = "$2" ]; then
+              return 1
+            fi
+            [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+          }
+
+          # Highest first, so the first published candidate found is the highest
+          # published one and the walk stops there. A release that is the newest
+          # tag - every normal release, and the very first one ever - has no
+          # candidate above it and reads nothing at all.
+          #
+          # The git glob is as close as a shell pattern gets and it is not
+          # close : it also matches "v2.0-rc1" and "v1.0.1.2", neither of which
+          # a tag push to this workflow can ever publish, so the walk used to
+          # spend registry reads weighing versions that cannot exist and would
+          # have let one of them - pushed by hand into the registry - hold
+          # "latest" back. The grep is the trigger's own two shapes written as
+          # one regular expression, so what is weighed here is exactly what can
+          # be published. Unquoted below on purpose : the list has to split into
+          # words, and after this filter a candidate is digits and dots, with no
+          # character a glob could act on
+          CANDIDATES="$(git tag --list 'v[0-9]*.[0-9]*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$')" || true
+
+          BLOCKER=""
+          UNREADABLE=""
+          for CANDIDATE in $CANDIDATES; do
+            if ! higher_than "$CANDIDATE" "$GITHUB_REF_NAME"; then
+              break
+            fi
+            STATUS=0
+            version_is_published "$CANDIDATE" || STATUS=$?
+            case "$STATUS" in
+              0) BLOCKER="$CANDIDATE"; break ;;
+              1) ;;  # tagged in git, never pushed : it outranks nothing
+              *) UNREADABLE="$CANDIDATE"; break ;;
+            esac
+          done
+
+          if [ -n "$UNREADABLE" ]; then
+            # Declining is what this decision does whenever it is unsure, and it
+            # never costs the release itself - the version tag and the release
+            # note still go out. The next release asks the registry again, and
+            # re-firing this tag from the Actions tab retries it immediately
+            echo "::warning::Could not tell whether $UNREADABLE is published, 'latest' will be left untouched"
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$BLOCKER" ]; then
+            echo "$BLOCKER is already published and outranks $GITHUB_REF_NAME, 'latest' will be left untouched"
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No published version outranks $GITHUB_REF_NAME, it will be published as 'latest'"
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        # Annotations are attached to the image manifests alone by default. The
+        # index is what "docker pull" and "imagetools inspect" resolve first, and
+        # reading annotations there is what a registry showing a description
+        # does, so both levels are named
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          # The two entries below are docker.io/tigerblue77/dell_omsa and
+          # ghcr.io/tigerblue77/dell_omsa. Said here rather than at the end of
+          # each line : from v6 on the action only strips a "#" that starts a
+          # line, so a trailing note would be read as part of the image name
+          images: |
+            ${{ steps.docker_image_name.outputs.value }}
+            ghcr.io/${{ steps.docker_image_name.outputs.value }}
+          # github.ref_name is the tag name on both the push and the
+          # workflow_dispatch paths, whereas "type=ref,event=tag" only resolves
+          # on a push tag event and would leave a dispatched run with no tag at
+          # all
+          tags: |
+            type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ steps.highest_version.outputs.value == 'true' }}
+          # The explicit "latest" entry above is the only thing that may publish
+          # it, gated on the check above. latest=auto is already inert for
+          # type=raw entries, so this pins that behaviour rather than changing
+          # it, and keeps it pinned should a type=semver or type=ref entry ever
+          # be added here
+          flavor: |
+            latest=false
+          # Spelled out rather than left to the action.
+          #
+          # The licence first, because it is the one the action fills in by
+          # itself and gets wrong : it derives org.opencontainers.image.licenses
+          # from GitHub's licence detection, hands it to build-push-action as a
+          # --label, and a --label wins over a LABEL line in the Dockerfile. So
+          # the identifier a published image carried would be a scanner's guess
+          # at this project's terms rather than the project's own statement of
+          # them. Stated here, a licence change is a matter of editing this
+          # repository.
+          #
+          # Then the three that exist to be read back off the published image
+          # later, because a registry is the only state these workflows keep :
+          # base.digest and the OMSA version are what "Published image refresh"
+          # compares against to tell that something outside this repository has
+          # moved, and image.version is what tells it which release "latest" is
+          # currently on. The OMSA one has no OCI equivalent - the specification
+          # has no label for "the version of the third-party payload this image
+          # was built around" - so it is namespaced under the repository's own
+          # reverse-DNS, which is what the specification asks of a custom label
+          labels: |
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ steps.omsa.outputs.version }}
+          # The same five again, and not a duplication that could be dropped :
+          # the action's getAnnotations() reads THIS input and never the one
+          # above, so a custom label stated only there reaches the image config
+          # and nothing else. Left unstated here, the licence annotation would be
+          # the scanner's guess sitting on the index beside a config label
+          # reading AGPL-3.0-only - the exact disagreement the block above exists
+          # to prevent
+          annotations: |
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            io.github.tigerblue77.dell-omsa.srvadmin-all.version=${{ steps.omsa.outputs.version }}
+
+      # There is no "Set up QEMU" step above this one, and the build below names
+      # linux/amd64 alone. That is a decision, not an omission, and this comment
+      # is here so that whoever notices the missing QEMU step finds the reason
+      # instead of "fixing" it.
+      #
+      # This image exists to run Dell OpenManage Server Administrator, and OMSA
+      # is x86_64 software. Every one of the forty packages that make up
+      # srvadmin-all in Dell's EL9 tree is x86_64 - the thirty components under
+      # srvadmin/ and the ten meta-RPMs beside them, checked against the listing
+      # rather than assumed. There is no aarch64 build, there is no source to
+      # rebuild one from, and there will not be one : OMSA shipped its final
+      # release in September 2024 and is in sustenance until September 2027.
+      #
+      # So an arm64 image would be an arm64 AlmaLinux with no OMSA in it. It
+      # would not fail to build - "dnf install srvadmin-all" would simply find
+      # nothing to install, or the whole build would die inside QEMU emulating a
+      # 140 MB package installation for no reason - and what it published would
+      # be an image that cannot do the one thing this repository exists for,
+      # under a multi-platform index that tells users it can.
+      #
+      # Building one platform is also what makes the rest of this cheap : a
+      # single-platform build can be loaded into the local daemon, which is what
+      # would make a smoke test possible here if one is ever wanted
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # No retry pair around this step, where the sibling repository carries one.
+      # Its retry was written after thirty tags were pushed inside twenty-five
+      # minutes and eighteen builds died on a 429 from Docker Hub while loading
+      # the base image metadata. Neither half of that applies here : releases are
+      # serialised by the concurrency group above so there is no storm to ride
+      # out, the job is logged in to Docker Hub so its quota is the account's and
+      # not the shared runner address's, and the base image digest has already
+      # been resolved above behind its own retry ladder. What is left is a second
+      # full build of a 1.5 GB image on the off chance, against one click on
+      # "Re-run jobs" - which is the documented recovery path and the reason
+      # workflow_dispatch is declared at the top
+      - name: Build and publish Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # See the comment above "Set up Docker Buildx". Named explicitly rather
+          # than left to default to the runner's own platform, so that the single
+          # platform is a statement someone made rather than a consequence of
+          # where the job happened to run
+          platforms: linux/amd64
+          file: ./Dockerfile
+          push: true
+          # Built on the digest resolved above rather than on "almalinux:9"
+          # re-resolved here, so org.opencontainers.image.base.digest describes
+          # the base these bytes were actually built on. This is the half that
+          # needs the Dockerfile's ARG BASE_IMAGE : on a Dockerfile without it,
+          # this argument is accepted and ignored, the FROM line resolves on its
+          # own, and the label silently stops being a fact about the image. That
+          # is why "Resolve the digest of the base image" refuses to go on when
+          # the Dockerfile has no ARG-declared base - by the time the argument
+          # reaches this step there is nothing left that could notice
+          build-args: |
+            BASE_IMAGE=${{ steps.base.outputs.pinned }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+
+      # Last, and after the push, because a release note is the announcement that
+      # a version is out : announcing it before the image was pushed is how the
+      # sibling repository ended up with seventeen GitHub releases pointing at
+      # versions nothing could pull. Published only once the push went through, a
+      # release that fails simply does not exist, and re-firing the workflow from
+      # the Actions tab publishes it for real.
+      #
+      # And written only when the tag has no release yet, because
+      # softprops/action-gh-release does not replace a note, it APPENDS to one.
+      # Asked only to generate notes it is handed no body of its own, so on a tag
+      # that already has a release it re-sends the body already there and appends
+      # the notes it has just generated to that. First run, one copy comes out ;
+      # second run, the copy the first one wrote is what gets appended to. Two
+      # releases in the sibling repository came out carrying their changelog
+      # twice and were repaired by hand. The "append_body" input is not what does
+      # this and setting it to false changes nothing - it only ever applies to a
+      # body the step supplies itself.
+      #
+      # Re-firing a release is the recovery path for a build that died before
+      # publishing, and what it is fired for is the image. A changelog that has
+      # already gone out is not something to rewrite out of today's pull request
+      # titles and today's contributor names - and leaving it alone is also what
+      # makes an upgrade note written by hand above the changelog survive, by
+      # construction rather than by a rule about where it is allowed to sit.
+      # Deleting the release is what asks for a new note
+      - name: Check whether this version already has its release note
+        id: release_note
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # "2>&1 >/dev/null" and not the other order : the first sends the
+          # diagnostics to the substitution, the second drops the release body gh
+          # would otherwise print
+          if DIAGNOSTICS="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1 >/dev/null)"; then
+            echo "$GITHUB_REF_NAME already has a release, its note is left exactly as it is"
+            echo "value=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Three answers and not two, the way every other decision here reads a
+          # registry or an API : "there is no release" and "GitHub did not
+          # answer" are not the same thing. They lead to the same place, and they
+          # are still told apart, because only one of them is worth a warning
+          if printf '%s' "$DIAGNOSTICS" | grep -q 'HTTP 404'; then
+            echo "$GITHUB_REF_NAME has no release, its note is written now"
+            echo "value=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Unlike every other unreadable answer in these workflows this one goes
+          # on rather than stops, because the two mistakes are not the same size.
+          # A note written twice shows on the release page and is repaired in one
+          # edit ; a note never written at all is a version that announces itself
+          # nowhere
+          printf '%s\n' "$DIAGNOSTICS" >&2
+          echo "::warning::Could not tell whether $GITHUB_REF_NAME already has a release, so its note is written rather than risk a version that announces itself nowhere. If it had one, it now carries its changelog twice and one copy has to be deleted by hand"
+          echo "value=true" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release note
+        if: steps.release_note.outputs.value == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
