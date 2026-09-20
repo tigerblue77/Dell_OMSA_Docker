@@ -76,12 +76,52 @@ jobs:
       # lookup a few seconds apart rather than a readout of the build's own
       # resolution. The two differ only if the tag moves in between.
       #
-      # The "awk '{ print $2 }'" assumes the plain "FROM <image>" this Dockerfile
-      # has : no "--platform" flag in front of the image and no "AS <stage>"
-      # behind it
+      # Reading the FROM line means handling the two shapes this Dockerfile has
+      # worn. Today it is a plain "FROM <image>". The fix for #9 turns it into
+      #
+      #     ARG BASE_IMAGE=almalinux:9
+      #     FROM ${BASE_IMAGE}
+      #
+      # so that the publishing workflow can pass the exact digest it resolved
+      # rather than letting the FROM line re-resolve a minute later. A bare
+      # "awk '{ print $2 }'" then yields the literal string "${BASE_IMAGE}",
+      # which "docker pull" cannot resolve -- and it fails eleven seconds in,
+      # before the build, which is how this was found rather than reasoned out.
+      #
+      # So a FROM naming a variable is followed back to that variable's ARG
+      # default. Anything else -- a variable with no default, a FROM this parser
+      # does not understand -- is a loud failure here rather than a confusing
+      # one three steps later. What is deliberately NOT handled is a --platform
+      # flag in front of the image or an "AS <stage>" behind it : this
+      # Dockerfile has a single unnamed stage, and a parser pretending to
+      # understand multi-stage builds it has never seen would be worse than one
+      # that refuses
       - name: Record what the base image tag resolves to today
         run: |
           base_image=$(grep --max-count=1 --extended-regexp '^[[:space:]]*FROM[[:space:]]' Dockerfile | awk '{ print $2 }')
+
+          case "$base_image" in
+            '${'*'}' | '$'*)
+              base_image_argument=${base_image#\$}
+              base_image_argument=${base_image_argument#\{}
+              base_image_argument=${base_image_argument%\}}
+              echo "The Dockerfile's FROM names the build argument $base_image_argument, following it back to its default"
+              # "|| true" so that a variable with no ARG default reaches the guard below
+              # and fails with its message. Without it, pipefail plus the step's own
+              # "set -e" kill the step on the failed grep, one line early and silent --
+              # which is the failure mode this whole block exists to avoid
+              base_image=$(grep --max-count=1 --extended-regexp "^[[:space:]]*ARG[[:space:]]+${base_image_argument}=" Dockerfile |
+                sed --regexp-extended "s/^[[:space:]]*ARG[[:space:]]+${base_image_argument}=//" || true)
+              ;;
+          esac
+
+          case "$base_image" in
+            '' | *'$'*)
+              echo "::error::could not resolve the Dockerfile's base image; the FROM line reads '$(grep --max-count=1 --extended-regexp '^[[:space:]]*FROM[[:space:]]' Dockerfile)'"
+              exit 1
+              ;;
+          esac
+
           echo "The Dockerfile starts from $base_image"
 
           docker pull --quiet "$base_image"
