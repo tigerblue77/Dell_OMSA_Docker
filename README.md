@@ -245,7 +245,7 @@ modprobe: FATAL: Module dell_rbu not found in directory /lib/modules/5.10.0-21-a
 
 It is not universally cosmetic, though, and it is worth knowing which case you are in: on XCP-ng, whose kernel ships without the module, [OMSA's services have been reported to fail to start outright](https://xcp-ng.org/forum/topic/2499/broken-dell-management-missing-driver), taking port 1311 with them. So: if the web interface answers, ignore the line. If it does not, the missing module is a candidate rather than a red herring, and the fix is to get the module onto the host — most distributions ship it as `CONFIG_DELL_RBU=m` and it is a `modprobe dell_rbu` away, some package it separately.
 
-`dcdbas` and the `ipmi_*` modules are a different matter — without those, OMSA sees nothing at all.
+`dcdbas` and the `ipmi_*` modules are what OMSA reads the hardware *through*, so without them it comes up and reports nothing — which is a different failure from not coming up, and worth telling apart. Measured rather than assumed: this project's CI starts the container on a kernel that has neither `dcdbas` nor `dell_rbu`, and the web interface answers on 1311 regardless. If the interface loads and every table is empty, the modules are what to look at. If it does not load at all, they are not.
 
 ### Nothing is listening on port 1311
 
