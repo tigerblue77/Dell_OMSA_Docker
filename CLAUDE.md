@@ -99,6 +99,13 @@ for is narrow : routine calls a careful colleague makes alone stay made alone, a
 is what changes the shape of what gets delivered. A default chosen silently is a decision nobody
 made, and it surfaces at review, which is the most expensive place for it to surface.
 
+**A reply is as short as the decision it carries.** A wall of prose is skipped whole, which costs
+more than saying too little : what got skipped included the question. So the verdict first, the
+numbers behind it, the question that needs an answer, and nothing else. The reasoning that earned a
+conclusion belongs in the commit message and the pull request body, where a reviewer can go and find
+it ; repeating it in the chat is the second copy that drifts. Tables and lists over paragraphs, and
+never a restatement of what was just asked.
+
 **A request to merge says what the pull request brings.** Merging is the maintainer's own act, so
 the ask carries what they need in order to decide : what the change does, what it is worth, what in
 it could not be verified and why, and — where it has siblings — the order it wants merging in.
