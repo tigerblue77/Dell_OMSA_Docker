@@ -220,7 +220,9 @@ readonly RUNG_IDS=(
 	09-rawio-ipmi-megaraid
 	10-rawio-ipmi
 	11-ipmi
-	12-nothing
+	12-caps3-only
+	13-admin-only
+	14-nothing
 )
 
 # The control: the recipe the README tells people to use today. Everything else
@@ -240,7 +242,9 @@ rung_label() {
 	09-rawio-ipmi-megaraid) printf '%s\n' 'RAWIO, ipmi0 + PERC ioctl node' ;;
 	10-rawio-ipmi) printf '%s\n' 'RAWIO, ipmi0' ;;
 	11-ipmi) printf '%s\n' 'ipmi0 alone, no capability' ;;
-	12-nothing) printf '%s\n' 'nothing at all (negative control)' ;;
+	12-caps3-only) printf '%s\n' 'RAWIO+ADMIN+MODULE, no device, no mounts' ;;
+	13-admin-only) printf '%s\n' 'SYS_ADMIN alone, no device, no mounts' ;;
+	14-nothing) printf '%s\n' 'nothing at all (negative control)' ;;
 	esac
 }
 
@@ -260,7 +264,9 @@ rung_rationale() {
 	09-rawio-ipmi-megaraid) printf '%s\n' 'SYS_RAWIO with the PERC ioctl node passed in as a device. This is the rung that could plausibly answer ShaneMcC/docker-omsa#33 for storage without any bind mount at all.' ;;
 	10-rawio-ipmi) printf '%s\n' 'SYS_RAWIO and the IPMI device, nothing else: the smallest configuration that still grants a hardware capability.' ;;
 	11-ipmi) printf '%s\n' 'The configuration lovoo/ipmi_exporter issue #9 tried and could not make work. Measuring it here settles what it does and does not buy.' ;;
-	12-nothing) printf '%s\n' 'The negative control. Whatever passes here passes with no hardware access whatsoever, so the same pass higher up the ladder is not evidence of anything.' ;;
+	12-caps3-only) printf '%s\n' 'The first of two rungs that ask about systemd rather than about OMSA, and the only pair in this ladder that needs no Dell hardware at all: no device node, no bind mount, nothing the machine has to own. The maintainer reported the container looping without --privileged, and his logs show the entrypoint completing before it restarts, so it is systemd as PID 1 that is failing. Whether these three capabilities are enough for it is answerable on any host with a Docker daemon, including a virtual machine.' ;;
+	13-admin-only) printf '%s\n' 'The same question with only SYS_ADMIN, which is the capability systemd is usually said to want. If this starts and rung 12 does too, the looping has a one-flag answer and it is separable from anything OMSA needs.' ;;
+	14-nothing) printf '%s\n' 'The negative control. Whatever passes here passes with no hardware access whatsoever, so the same pass higher up the ladder is not evidence of anything.' ;;
 	esac
 }
 
@@ -319,7 +325,13 @@ rung_docker_arguments() {
 	11-ipmi)
 		printf '%s\n' '--device' "${IPMI_DEVICE}"
 		;;
-	12-nothing) ;;
+	12-caps3-only)
+		printf '%s\n' '--cap-add' 'SYS_RAWIO' '--cap-add' 'SYS_ADMIN' '--cap-add' 'SYS_MODULE'
+		;;
+	13-admin-only)
+		printf '%s\n' '--cap-add' 'SYS_ADMIN'
+		;;
+	14-nothing) ;;
 	esac
 }
 
