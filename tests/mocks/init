@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "/sbin/init" used by the test suite.
+#
+# This one is not found through the PATH : the entrypoint ends in
+# "exec /sbin/init", an absolute path no PATH entry can intercept, so the
+# harness copies this file to $TEST_ROOT/sbin/init and the sandboxed copy of the
+# entrypoint executes it there.
+#
+# Reaching it is the whole contract of the entrypoint : everything before that
+# line is provisioning, and the container is only useful if systemd is handed
+# the machine at the end of it. The call log is therefore read as "the
+# entrypoint got all the way through", and the real systemd would never return
+# at all, so this one exits immediately instead of pretending otherwise.
+#
+# Recognized environment variables:
+#   MOCK_INIT_CALL_LOG           file the invocations are appended to. An empty
+#                                one means the handover never happened
+#   MOCK_INIT_OUTPUT             what it prints before exiting
+#   MOCK_INIT_EXIT_CODE          exit code (default 0). A distinctive value is
+#                                how a test tells an "exec" from a plain call :
+#                                exec'd, this status IS the entrypoint's own
+
+if [ -n "${MOCK_INIT_CALL_LOG:-}" ]; then
+  printf '%s\n' "init${*:+ $*}" >> "$MOCK_INIT_CALL_LOG"
+fi
+
+if [ -n "${MOCK_INIT_OUTPUT:-}" ]; then
+  printf '%s\n' "$MOCK_INIT_OUTPUT"
+fi
+
+exit "${MOCK_INIT_EXIT_CODE:-0}"

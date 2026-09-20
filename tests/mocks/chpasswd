@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "chpasswd" used by the test suite.
+#
+# It stands in for the one command that sets a real password on a real account,
+# so that a run changes nothing on the machine the suite happens to be on.
+#
+# Two things are recorded rather than one, because the password does not travel
+# through the arguments : the invocation goes to $MOCK_CHPASSWD_CALL_LOG
+# verbatim, and what arrived on the standard input goes to
+# $MOCK_CHPASSWD_STDIN_LOG. The separation is what lets a test assert both that
+# the password reached chpasswd and that it never appeared in the arguments,
+# where the process list would carry it.
+#
+# The standard input is always read to its end, even when the mock is made to
+# fail : leaving it unread would close the pipe under the "echo" feeding it and
+# make the entrypoint see a broken pipe rather than the failure it was set up
+# for.
+#
+# Recognized environment variables:
+#   MOCK_CHPASSWD_CALL_LOG       file the invocations are appended to
+#   MOCK_CHPASSWD_STDIN_LOG      file the standard input is appended to
+#   MOCK_CHPASSWD_OUTPUT         what it prints (on stderr when it fails, the way
+#                                the real tool reports an unknown user)
+#   MOCK_CHPASSWD_EXIT_CODE      exit code (default 0)
+#   MOCK_CHPASSWD_SECOND_EXIT_CODE  exit code returned from the
+#                                MOCK_CHPASSWD_SWITCH_AFTER_CALLS+1-th call
+#                                onwards, so that an entrypoint run twice can be
+#                                made to see the second attempt refused
+#   MOCK_CHPASSWD_SWITCH_AFTER_CALLS  when to switch (default 1)
+
+if [ -n "${MOCK_CHPASSWD_CALL_LOG:-}" ]; then
+  printf '%s\n' "chpasswd${*:+ $*}" >> "$MOCK_CHPASSWD_CALL_LOG"
+fi
+
+STANDARD_INPUT=""
+if [ ! -t 0 ]; then
+  STANDARD_INPUT=$(cat)
+fi
+
+if [ -n "${MOCK_CHPASSWD_STDIN_LOG:-}" ] && [ -n "$STANDARD_INPUT" ]; then
+  printf '%s\n' "$STANDARD_INPUT" >> "$MOCK_CHPASSWD_STDIN_LOG"
+fi
+
+EXIT_CODE="${MOCK_CHPASSWD_EXIT_CODE:-0}"
+if [ -n "${MOCK_CHPASSWD_SECOND_EXIT_CODE:-}" ] && [ -n "${MOCK_CHPASSWD_CALL_LOG:-}" ]; then
+  # The current call is already in the log, so this counts it too
+  CALL_NUMBER=$(wc -l < "$MOCK_CHPASSWD_CALL_LOG")
+  if [ "$CALL_NUMBER" -gt "${MOCK_CHPASSWD_SWITCH_AFTER_CALLS:-1}" ]; then
+    EXIT_CODE="$MOCK_CHPASSWD_SECOND_EXIT_CODE"
+  fi
+fi
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+  printf '%s' "${MOCK_CHPASSWD_OUTPUT:-chpasswd: line 1: user does not exist}" >&2
+  exit "$EXIT_CODE"
+fi
+
+if [ -n "${MOCK_CHPASSWD_OUTPUT:-}" ]; then
+  printf '%s\n' "$MOCK_CHPASSWD_OUTPUT"
+fi
+
+exit 0

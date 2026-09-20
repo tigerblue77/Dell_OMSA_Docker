@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Fake "systemctl" used by the test suite.
+#
+# It stands in for the systemd of the container, which does not exist while the
+# entrypoint runs : systemd is what the entrypoint hands over to at its very
+# last line, so every "systemctl" call it makes before that is made against a
+# system manager that is not up yet. On a machine where one IS up -- a CI runner,
+# a developer's laptop -- the real tool would enable a unit on that machine
+# instead, which is the second reason this mock exists.
+#
+# Every invocation is appended verbatim to $MOCK_SYSTEMCTL_CALL_LOG, which is
+# how a test asserts that the unit the image depends on was enabled, and which
+# one.
+#
+# Recognized environment variables:
+#   MOCK_SYSTEMCTL_CALL_LOG      file the invocations are appended to
+#   MOCK_SYSTEMCTL_OUTPUT        stdout (on stderr when it fails)
+#   MOCK_SYSTEMCTL_EXIT_CODE     exit code (default 0)
+#   MOCK_SYSTEMCTL_SECOND_OUTPUT     stdout returned from the
+#                                MOCK_SYSTEMCTL_SWITCH_AFTER_CALLS+1-th call
+#                                onwards, so that a unit can be made to answer
+#                                "disabled" and then "enabled" across two calls
+#   MOCK_SYSTEMCTL_SECOND_EXIT_CODE  exit code from that call onwards
+#   MOCK_SYSTEMCTL_SWITCH_AFTER_CALLS  when to switch (default 1)
+
+if [ -n "${MOCK_SYSTEMCTL_CALL_LOG:-}" ]; then
+  printf '%s\n' "systemctl${*:+ $*}" >> "$MOCK_SYSTEMCTL_CALL_LOG"
+fi
+
+OUTPUT="${MOCK_SYSTEMCTL_OUTPUT:-}"
+EXIT_CODE="${MOCK_SYSTEMCTL_EXIT_CODE:-0}"
+
+if [ -n "${MOCK_SYSTEMCTL_CALL_LOG:-}" ]; then
+  # The current call is already in the log, so this counts it too
+  CALL_NUMBER=$(wc -l < "$MOCK_SYSTEMCTL_CALL_LOG")
+  if [ "$CALL_NUMBER" -gt "${MOCK_SYSTEMCTL_SWITCH_AFTER_CALLS:-1}" ]; then
+    [ -n "${MOCK_SYSTEMCTL_SECOND_OUTPUT:-}" ] && OUTPUT="$MOCK_SYSTEMCTL_SECOND_OUTPUT"
+    [ -n "${MOCK_SYSTEMCTL_SECOND_EXIT_CODE:-}" ] && EXIT_CODE="$MOCK_SYSTEMCTL_SECOND_EXIT_CODE"
+  fi
+fi
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+  printf '%s' "${OUTPUT:-Failed to enable unit: Unit file does not exist.}" >&2
+  exit "$EXIT_CODE"
+fi
+
+if [ -n "$OUTPUT" ]; then
+  printf '%s\n' "$OUTPUT"
+fi
+
+exit 0

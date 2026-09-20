@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2020-2026 Tigerblue77 and the Dell OMSA Docker image contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Tests
+
+# The suite needs bash, coreutils, GNU grep and awk, and nothing else : no Dell hardware, no
+# iDRAC, no Docker daemon, no network. Every external command the entrypoint calls is mocked,
+# and every absolute path it writes to is redirected into a throwaway sandbox. So this job is
+# a checkout and a six-second run -- there is no install step because there is nothing to
+# install, and that is a property of the suite worth not losing.
+#
+# It runs on pull_request and on push to master rather than on a tag. The sibling repository
+# also runs its suite inside the built image before publishing ; there is no equivalent here,
+# because this suite tests the entrypoint against mocked system commands rather than against
+# the image, and the image does not ship tests/. What the image itself is worth is
+# build_docker_image.yml's business.
+#
+# The runner's own exit codes are the contract : 0 everything passed, 1 a case failed OR THE
+# RUN REFUSED TO START, 2 the command line was wrong. That second one matters here -- a
+# duplicate case name across files, or a case file that calls exit while being sourced, is
+# reported as a failed run rather than as a suite that quietly ran fewer cases than it has.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Run the test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # --summary appends a Markdown table -- a row per case, with the expected and actual
+      # values and a rerun command for every failure -- and GITHUB_STEP_SUMMARY is exactly
+      # what renders it. So a failure is readable from the pull request's checks tab without
+      # opening the log, which is the difference between a red tick somebody investigates and
+      # one they re-run.
+      #
+      # --junit is written too, and uploaded below rather than fed to a third-party
+      # results-publishing action. The step summary already carries what a reviewer reads ;
+      # the XML is there for whoever wants to diff two runs or feed it to something else, and
+      # it costs one artifact rather than one more action holding a token.
+      - name: Run the test suite
+        run: |
+          ./tests/run_tests.sh \
+            --no-color \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --junit test-results.xml
+
+      # if: always() so the results survive a failing run, which is the only run whose results
+      # anybody wants.
+      - name: Upload the JUnit results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: test-results.xml
+          if-no-files-found: error
