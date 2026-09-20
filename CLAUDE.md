@@ -92,6 +92,25 @@ to match, and a script that arrives in a shape it misses is analysed by nothing 
 say so. Unlike the sibling repository, **nothing here enforces the list** — there is no test suite
 yet, so it is guarded by review alone.
 
+**Nothing is assumed : an ambiguity is a question, not a judgement call.** Where two readings of
+an instruction would lead to materially different work, the question is put before the work starts,
+even though asking costs a round trip — because guessing costs the work. The judgement being asked
+for is narrow : routine calls a careful colleague makes alone stay made alone, and what gets asked
+is what changes the shape of what gets delivered. A default chosen silently is a decision nobody
+made, and it surfaces at review, which is the most expensive place for it to surface.
+
+**A request to merge says what the pull request brings.** Merging is the maintainer's own act, so
+the ask carries what they need in order to decide : what the change does, what it is worth, what in
+it could not be verified and why, and — where it has siblings — the order it wants merging in.
+"This is ready" makes them work all of that out from the diff, which is the work the session was
+supposed to have already done, done twice. In this repository the unverified half is rarely empty
+and is usually the same half : nothing here can be confirmed against a real PowerEdge from a
+session, so say which claims rest on CI and which rest on nobody having checked yet.
+
+Both of those are the maintainer's standing rules across all three repositories rather than this
+one's own, and they are stated here verbatim for the reason the sign-off convention is : a rule that
+holds in one repository and not another is a rule nobody can rely on.
+
 **Language.** Documentation, comments, commit messages, issues and pull requests are in English.
 
 **Issue and pull request text runs the full width GitHub gives it.** No hard line break inside a
