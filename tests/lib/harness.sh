@@ -98,18 +98,74 @@ MOCK
 }
 
 # The copy under test, with its absolute paths pointed at the sandbox.
+#
+# A rewrite that silently matches nothing is the dangerous failure here, not a
+# failing test : the copy is executed, so an unrewritten `rm -Rf /tmp/*
+# /var/tmp/*` runs against the machine hosting the suite. sed reports no error
+# for a pattern that matches nothing, and the third expression below matches one
+# exact literal -- reorder its two arguments upstream, or write `-rf` instead of
+# `-Rf`, and it quietly stops applying. So the copy is checked before anything
+# runs it, and a check that fails stops the suite rather than guessing.
+#
+# The checks are a guard, not a sandbox. Running the entrypoint under a chroot or
+# inside a container would remove the need to rewrite anything at all, and is the
+# right answer if this harness ever has to cover more than one script.
 function install_entrypoint() {
   sed -e "s#/opt/dell#$SANDBOX/opt/dell#g" \
       -e "s#/sbin/init#$SANDBOX/sbin/init#g" \
       -e "s#rm -Rf /tmp/\* /var/tmp/\*#rm -Rf $SANDBOX/tmp/* $SANDBOX/var/tmp/*#" \
       "$ENTRYPOINT_SOURCE" > "$SANDBOX/run.sh"
   chmod +x "$SANDBOX/run.sh"
+
+  # Every rewrite this function is responsible for has to have landed. A check
+  # that fails records a failure and takes the copy away rather than calling
+  # exit : a case runs inside a command substitution, so an exit there leaves
+  # only that subshell, the counts never come back, and the run reports the case
+  # as ok. Refusing loudly has to go through the same bookkeeping as an
+  # assertion or it is not refusing at all.
+  local REPLACEMENT
+  for REPLACEMENT in "$SANDBOX/opt/dell" "$SANDBOX/sbin/init" "rm -Rf $SANDBOX/tmp/"; do
+    if ! grep -qF -- "$REPLACEMENT" "$SANDBOX/run.sh"; then
+      rm -f "$SANDBOX/run.sh"
+      printf 'harness: no rewrite produced "%s" -- refusing to run the copy.\n' "$REPLACEMENT" >&2
+      ASSERTIONS=$((ASSERTIONS + 1))
+      _fail "the harness produced no rewrite for \"$REPLACEMENT\" : $ENTRYPOINT_SOURCE has changed shape and install_entrypoint() no longer matches it"
+      return 1
+    fi
+  done
+
+  # And nothing the copy deletes may sit outside the sandbox -- which catches a
+  # destructive line the rewrites above do not know about yet, not just the one
+  # they were written for.
+  local STRAY
+  STRAY="$(grep -nE '(^|[[:space:];&|(])rm([[:space:]]|$)' "$SANDBOX/run.sh" | grep -vF -- "$SANDBOX" || true)"
+  if [ -n "$STRAY" ]; then
+    rm -f "$SANDBOX/run.sh"
+    printf 'harness: the copy would delete outside the sandbox -- refusing to run it.\n' >&2
+    ASSERTIONS=$((ASSERTIONS + 1))
+    _fail "the copy would delete outside the sandbox : ${STRAY//$'\n'/ ; }"
+    return 1
+  fi
 }
 
 # Runs the entrypoint. Its exit status lands in ENTRYPOINT_STATUS and its
 # combined output in ENTRYPOINT_OUTPUT, so a case can assert on either without
 # the run itself deciding whether the case continues.
 function run_entrypoint() {
+  # install_entrypoint() deletes the copy when a rewrite did not land, so its
+  # absence here means the guard already refused and said why.
+  if [ ! -f "$SANDBOX/run.sh" ]; then
+    # The case carries on against these rather than reading an unset variable :
+    # under `set -u` that would kill the case's shell, and the reason recorded
+    # above would die with it.
+    ENTRYPOINT_OUTPUT=''
+    ENTRYPOINT_STATUS=127
+    export ENTRYPOINT_OUTPUT ENTRYPOINT_STATUS
+    ASSERTIONS=$((ASSERTIONS + 1))
+    _fail "the entrypoint was never installed, so there was nothing to run"
+    return 1
+  fi
+
   ENTRYPOINT_OUTPUT="$(PATH="$SANDBOX/bin:$PATH" sh "$SANDBOX/run.sh" 2>&1)"
   ENTRYPOINT_STATUS=$?
   export ENTRYPOINT_OUTPUT ENTRYPOINT_STATUS

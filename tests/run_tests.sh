@@ -94,6 +94,17 @@ for CASE_NAME in "${CASES[@]}"; do
   )"
   CASE_ASSERTIONS="$(printf '%s' "$RESULT" | head -n 1)"
   CASE_FAILURES="$(printf '%s' "$RESULT" | tail -n +2 | grep -v '^$')"
+
+  # A case whose shell died -- an exit, a syntax error, a kill -- never printed
+  # its counts, so what comes back is not a number. Left to the arithmetic test
+  # below that reads as an error on stderr and then falls through to "ok", which
+  # is the silent pass this runner exists to refuse.
+  if ! printf '%s' "$CASE_ASSERTIONS" | grep -qE '^[0-9]+$'; then
+    FAILED=$((FAILED + 1))
+    printf '  FAIL  %s\n' "$READABLE"
+    printf '          the case shell exited before reporting ; nothing was counted\n'
+    continue
+  fi
   TOTAL_ASSERTIONS=$((TOTAL_ASSERTIONS + CASE_ASSERTIONS))
 
   # A case that asserted nothing passed by doing nothing, which is worse than a
